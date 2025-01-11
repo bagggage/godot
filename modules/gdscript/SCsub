@@ -6,16 +6,52 @@ Import("env_modules")
 
 env_gdscript = env_modules.Clone()
 
-env_gdscript.add_source_files(env.modules_sources, "*.cpp")
+# Thirdparty source files
+
+thirdparty_obj = []
+
+thirdparty_dir = "#thirdparty/bjit/"
+thirdparty_sources = [
+    "arch-arm64-emit.cpp",
+    "arch-arm64-ops.cpp",
+    "arch-x64-emit.cpp",
+    "arch-x64-ops.cpp",
+    "debug.cpp",
+    "ir-ops.cpp",
+    "module.cpp",
+    "opt-cse.cpp",
+    "opt-dce.cpp",
+    "opt-dom.cpp",
+    "opt-fold.cpp",
+    "opt-jump.cpp",
+    "opt-ra.cpp",
+    "opt-reassoc.cpp",
+    "opt-sink.cpp",
+    "sanity.cpp",
+]
+thirdparty_sources = [thirdparty_dir + file for file in thirdparty_sources]
+
+env_gdscript.Prepend(CPPPATH=[thirdparty_dir])
+
+env_thirdparty = env_gdscript.Clone()
+env_thirdparty.disable_warnings()
+env_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
+env.modules_sources += thirdparty_obj
+
+# Godot source files
+
+module_obj = []
+
+env_gdscript.add_source_files(module_obj, "*.cpp")
 
 if env.editor_build:
-    env_gdscript.add_source_files(env.modules_sources, "./editor/*.cpp")
+    env_gdscript.add_source_files(module_obj, "./editor/*.cpp")
 
     SConscript("editor/script_templates/SCsub")
 
     # Those two modules are required for the language server protocol
     if env["module_jsonrpc_enabled"] and env["module_websocket_enabled"]:
-        env_gdscript.add_source_files(env.modules_sources, "./language_server/*.cpp")
+        env_gdscript.add_source_files(module_obj, "./language_server/*.cpp")
     else:
         # Using a define in the disabled case, to avoid having an extra define
         # in regular builds where all modules are enabled.
@@ -26,4 +62,10 @@ if env.editor_build:
 
 if env["tests"]:
     env_gdscript.Append(CPPDEFINES=["TESTS_ENABLED"])
-    env_gdscript.add_source_files(env.modules_sources, "./tests/*.cpp")
+    env_gdscript.add_source_files(module_obj, "./tests/*.cpp")
+
+env_gdscript.add_source_files(module_obj, "*.cpp")
+env.modules_sources += module_obj
+
+# Needed to force rebuilding the module files when the thirdparty library is updated.
+env.Depends(module_obj, thirdparty_obj)
