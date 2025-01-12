@@ -39,10 +39,9 @@
 
 class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	enum Environment {
-		ENV_STACK = 0,
-		ENV_INSTANCE = 1,
-		ENV_MEMBERS = 2,
-		ENV_CONSTANTS = 3
+		ENV_INSTANCE = 0,
+		ENV_MEMBERS = 1,
+		ENV_CONSTANTS = 2
 	};
 
 	static constexpr bjit::Value jit_sp { 0 };
@@ -73,7 +72,8 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		};
 
 		ValueReference() = default;
-		ValueReference(const Variant::Type p_type) : type(p_type) {}
+		ValueReference(const Variant::Type p_type) :
+				type(p_type), is_changed(TYPE_CHANGED) {}
 		ValueReference(const Variant& p_constant) :
 				type(p_constant.get_type()), constant(&p_constant) {}
 
@@ -94,12 +94,14 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 
 		_FORCE_INLINE_ void drop_cache() {
-			is_changed = UNCHANGED;
+			is_changed = (is_changed == TYPE_CHANGED) ? TYPE_CHANGED : UNCHANGED;
 			cached.index = 0;
 		}
 
 		_FORCE_INLINE_ void reuse(const Variant::Type new_type) {
-			is_changed = (new_type != type) ? TYPE_CHANGED : UNCHANGED;
+			if (is_changed != TYPE_CHANGED) {
+				is_changed = (new_type != type) ? TYPE_CHANGED : UNCHANGED;
+			}
 
 			type = new_type;
 			cached.index = 0;
@@ -133,7 +135,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			DEV_ASSERT(is_primitive_type(type));
 			const unsigned data_offset = (index * sizeof(Variant)) + _variant_data_field_offset;
 
-			switch(constant->get_type()) {
+			switch(type) {
 				case Variant::BOOL:
 					cached = proc.li8(jit_sp, data_offset);
 					break;
@@ -150,7 +152,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	};
 
-	using ProcFunction = void (Variant*,Variant*,const Variant**,Variant*);
+	using ProcFunction = void (Object*,Variant*,const Variant*);
 
 	GDScriptFunction *function;
 
@@ -189,12 +191,19 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	int max_locals = 0;
 
 	int stack_top = 0;
+	int max_stack_size = 0;
 	int constants_top = 0;
 
 	List<int> stack_free_list;
 
 	int stack_alloc_idx() {
-		if (stack_free_list.is_empty()) return stack_top++; 
+		if (stack_free_list.is_empty()) {
+			int idx = stack_top++;
+			if (stack_top > max_stack_size) {
+				max_stack_size = stack_top;
+			}
+			return idx;
+		}
 
 		int idx = stack_free_list.back()->get();
 		stack_free_list.pop_back();
@@ -259,9 +268,13 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 		if (p_address.mode == Address::CONSTANT) {
 			// Load immediate value.
+			print_line("load imm -> constant(", p_address.address, "):", Variant::get_type_name(p_value.type));
 			return p_value._emit_load_constant(proc);
 		} else if (p_value.is_allocated()) {
+			print_line("load mem -> local(", p_address.address, "):", Variant::get_type_name(p_value.type));
 			return p_value._emit_load_from_memory(proc);
+		} else {
+			
 		}
 
 		// Invalid case
@@ -276,7 +289,10 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		ValueReference& dst = locals.write[dst_addr.address];
 
 		// Lazy: storing will be emitted only if a pointer to the value is accessed.
-		dst.is_changed = (dst.type != src_type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED;
+		if (dst.is_changed != ValueReference::TYPE_CHANGED) {
+			dst.is_changed = (dst.type != src_type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED;
+		}
+		print_line("lazy data store: local(", dst_addr.address, ")", Variant::get_type_name(dst.type), "->", Variant::get_type_name(src_type));
 
 		dst.type = src_type;
 		dst.cached = jit_value;
@@ -285,6 +301,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	bjit::Value emit_ptr_access(const Address& address) {
 		if (address.mode == Address::CONSTANT) {
 			ValueReference& value = constants.write[address.address];
+			print_line("get pointer -> constant(", address.address, "):", Variant::get_type_name(value.type));
 
 			if (value.is_ptr_cached()) return value.ptr;
 			DEV_ASSERT(value.is_allocated() == false);
@@ -296,6 +313,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 
 		ValueReference& value = locals.write[address.address];
+		print_line("get pointer -> local(", address.address, "):", Variant::get_type_name(value.type));
 
 		if (!value.is_ptr_cached()) {
 			DEV_ASSERT(value.is_allocated() == false);
@@ -303,25 +321,27 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			value.ptr = proc.iadd(jit_sp, proc.lcu(value.index * sizeof(Variant)));
 		}
 
-		const unsigned _data_offset = (value.index * sizeof(Variant)) + _variant_data_field_offset;
+		const unsigned data_offset = (value.index * sizeof(Variant)) + _variant_data_field_offset;
 
 		// Lazy storing if needed.
 		switch (value.is_changed) {
 			// Emit type field assign with falling to value assign.
 			case ValueReference::TYPE_CHANGED:
-				proc.si8(proc.lcu(value.type), jit_sp, (value.index * sizeof(Variant)));
+				print_line("storing type:", Variant::get_type_name(value.type), "offset:", (value.index * sizeof(Variant)));
+				proc.si32(proc.lcu(value.type), jit_sp, (value.index * sizeof(Variant)));
 			// Emit value assign.
 			case ValueReference::VALUE_CHANGED:
 				if (value.is_cached()) {
+					print_line("storing value:", Variant::get_type_name(value.type), "(cached) offset:", data_offset);
 					switch (value.type) {
 						case Variant::BOOL:
-							proc.si8(value.cached, jit_sp, _data_offset);
+							proc.si8(value.cached, jit_sp, data_offset);
 							break;
 						case Variant::FLOAT:
-							proc.sf64(value.cached, jit_sp, _data_offset);
+							proc.sf64(value.cached, jit_sp, data_offset);
 							break;
 						default:
-							proc.si64(value.cached, jit_sp, _data_offset);
+							proc.si64(value.cached, jit_sp, data_offset);
 							break;
 					}
 				}
@@ -332,6 +352,29 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 
 		return value.ptr;
+	}
+
+	bjit::Value emit_load_ptr_args(const Vector<Address>& p_args) {
+		if (p_args.size() == 0) return proc.lci(0);
+
+		Vector<bjit::Value> jit_ptrs;
+		jit_ptrs.resize(p_args.size());
+
+		for (int i = 0; i < p_args.size(); ++i) {
+			jit_ptrs.write[i] = emit_ptr_access(p_args[i]);
+		}
+
+		bjit::Value jit_ptr_args = proc.iadd(jit_sp, proc.lcu(stack_top * sizeof(Variant)));
+		for (int i = 0; i < p_args.size(); ++i) {
+			proc.si64(jit_ptrs[i], jit_ptr_args, i * sizeof(uintptr_t));
+		}
+
+		int _stack_slots = ((p_args.size() + 1) * sizeof(Variant*)) / sizeof(Variant);
+		if (stack_top + _stack_slots > max_stack_size) {
+			max_stack_size = stack_top + _stack_slots;
+		}
+	
+		return jit_ptr_args;
 	}
 
 	void add_stack_identifier(const StringName &p_id, int p_stackpos) {
@@ -355,6 +398,20 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			dirty_locals.insert(i + GDScriptFunction::FIXED_ADDRESSES_MAX);
 		}
 		locals.resize(current_locals);
+	}
+
+	const StringName* get_name_ptr(const StringName& p_identifier) {
+		int pos;
+		if (!name_map.has(p_identifier)) {
+			pos = name_map.size();
+			name_map[p_identifier] = pos;
+
+			function->global_names.append(p_identifier);
+		} else {
+			pos = name_map[p_identifier];
+		}
+
+		return &function->global_names[pos];
 	}
 
 	int get_name_map_pos(const StringName &p_identifier) {

@@ -257,6 +257,8 @@ void GDScriptJitCodeGenerator::end_parameters() {
 }
 
 void GDScriptJitCodeGenerator::write_start(GDScript *p_script, const StringName &p_function_name, bool p_static, Variant p_rpc_config, const GDScriptDataType &p_return_type) {
+	print_line("Compiling: ", p_script->get_script_path(), ":", p_function_name);
+
 	function = memnew(GDScriptFunction);
 
 	function->name = p_function_name;
@@ -275,22 +277,31 @@ void GDScriptJitCodeGenerator::write_start(GDScript *p_script, const StringName 
 }
 
 GDScriptFunction *GDScriptJitCodeGenerator::write_end() {
+	static HashMap<GDScriptFunction*, bjit::Module> jit_modules_map;
+
+	bjit::Module& jit_module = jit_modules_map[function];
+	if (jit_module.isLoaded()) jit_module.unload();
+
 	// Setup stacks size.
-	proc.getOps()[0].imm32 = stack_top * sizeof(Variant);
+	proc.getOps()[0].imm32 = max_stack_size * sizeof(Variant);
 
 	// Compile and debug.
+	int proc_index = 0;
 	{
-		std::vector<uint8_t> bytes;
-		proc.compile(bytes, 2);
+		proc.iret(proc.lcu(0));
+		proc_index = jit_module.compile(proc);
 
 		String text;
-		for (auto byte : bytes) {
+		for (auto byte : jit_module.getBytes()) {
 			text += vformat("%02x ", byte);
 		}
 		print_line(""); print_line(text);
 	}
 
-	function->_stack_size = stack_top;
+	jit_module.load();
+
+	function->_jit_function = jit_module.getPointer<ProcFunction>(proc_index);
+	function->_stack_size = max_stack_size;
 
 	// Fill constants.
 	function->constants.resize(constants_top);
@@ -331,7 +342,7 @@ void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Varian
 
 	if (value.has_type()) {
 		// Change `type` field.
-		proc.si8(proc.lci(p_new_type), jit_ptr, 0);
+		proc.si32(proc.lci(p_new_type), jit_ptr, 0);
 	} else {
 		emit_function_call(
 			VariantInternal::initialize,
@@ -343,14 +354,14 @@ void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Varian
 
 void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand) {
 	ValueReference& operand = get_value_ref(p_left_operand);
-	Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type, Variant::NIL);
 
 	print_line("unary operator:", Variant::get_operator_name(p_operator), "for type:", Variant::get_type_name(operand.type));
 
 	if (is_primitive_type(operand.type)) {
-		print_line("\tprimitive evaluation!");
-
+		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type, Variant::NIL);
 		bjit::Value jit_value = emit_data_load(operand, p_left_operand);
+
+		print_line("\tprimitive evaluation - ret_type:", Variant::get_type_name(ret_type));
 
 		switch (p_operator) {
 			case Variant::OP_BIT_NEGATE:
@@ -420,6 +431,74 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 }
 
 void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand, const Address &p_right_operand) {
+	ValueReference& lhs = get_value_ref(p_left_operand);
+	ValueReference& rhs = get_value_ref(p_right_operand);
+
+	print_line("binary operator:", Variant::get_type_name(lhs.type), Variant::get_operator_name(p_operator), Variant::get_type_name(rhs.type));
+
+	if (!lhs.has_type() || !rhs.has_type()) {
+		bjit::Value jit_lhs_ptr = emit_ptr_access(p_left_operand);
+		bjit::Value jit_rhs_ptr = emit_ptr_access(p_right_operand);
+		bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+
+		print_line("\tdynamic evaluation");
+		emit_function_call(
+			_variant_evaluate_wrapper,
+			proc.lci((int64_t)p_operator),
+			jit_lhs_ptr,
+			jit_rhs_ptr,
+			jit_target_ptr
+		);
+
+		return;
+	}
+
+	if (is_primitive_type(lhs.type) && is_primitive_type(rhs.type)) {
+		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type, rhs.type);
+
+		print_line("\tprimitive - return type:", Variant::get_type_name(ret_type));
+
+		bjit::Value jit_lhs = emit_data_load(lhs, p_left_operand);
+		bjit::Value jit_rhs = emit_data_load(rhs, p_right_operand);
+		bjit::Value jit_result;
+
+		const bool is_float = (lhs.type == Variant::FLOAT || rhs.type == Variant::FLOAT);
+
+		// Cast to float.
+		if (is_float) {
+			if (lhs.type != Variant::FLOAT) {
+				jit_lhs = proc.ci2d(jit_lhs);
+			} else if (rhs.type != Variant::FLOAT) {
+				jit_rhs = proc.ci2d(jit_rhs);
+			}
+
+			switch (p_operator) {
+				case Variant::OP_ADD:
+					jit_result = proc.dadd(jit_lhs, jit_rhs); break;
+				case Variant::OP_SUBTRACT:
+					jit_result = proc.dsub(jit_lhs, jit_rhs); break;
+				case Variant::OP_MULTIPLY:
+					jit_result = proc.dmul(jit_lhs, jit_rhs); break;
+				case Variant::OP_DIVIDE:
+					jit_result = proc.ddiv(jit_lhs, jit_rhs); break;	
+				default:
+					break;
+			}
+		} else switch (p_operator) {
+			case Variant::OP_ADD:
+				jit_result = proc.iadd(jit_lhs, jit_rhs); break;
+			case Variant::OP_SUBTRACT:
+				jit_result = proc.isub(jit_lhs, jit_rhs); break;
+			case Variant::OP_MULTIPLY:
+				jit_result = proc.imul(jit_lhs, jit_rhs); break;
+			case Variant::OP_DIVIDE:
+				jit_result = proc.idiv(jit_lhs, jit_rhs); break;	
+			default:
+				break;
+		}
+
+		emit_data_store(p_target, ret_type, jit_result);
+	}
 }
 
 void GDScriptJitCodeGenerator::write_type_test(const Address &p_target, const Address &p_source, const GDScriptDataType &p_type) {
@@ -488,7 +567,7 @@ void GDScriptJitCodeGenerator::write_assign_with_conversion(const Address &p_tar
 void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Address &p_source) {
 	ValueReference& source = get_value_ref(p_source);
 
-	print_line("assign for: ", source.type);
+	print_line("assign for: ", Variant::get_type_name(source.type));
 
 	if (is_primitive_type(source.type)) {
 		print_line("\tprimitive!");
@@ -536,9 +615,21 @@ void GDScriptJitCodeGenerator::write_call_async(const Address &p_target, const A
 }
 
 void GDScriptJitCodeGenerator::write_call_gdscript_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) {
+	print_line("gdscript utility call");
 }
 
 void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) {
+	print_line("utility call");
+
+	const StringName* name_ptr = get_name_ptr(p_function);
+
+	emit_function_call(
+		_variant_call_utility_function_wrapper,
+		proc.lcu((uintptr_t)name_ptr),
+		emit_ptr_access(p_target),
+		emit_load_ptr_args(p_arguments),
+		proc.lcu(p_arguments.size())
+	);
 }
 
 void GDScriptJitCodeGenerator::write_call_builtin_type(const Address &p_target, const Address &p_base, Variant::Type p_type, const StringName &p_method, bool p_is_static, const Vector<Address> &p_arguments) {
