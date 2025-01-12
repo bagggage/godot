@@ -45,75 +45,127 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		ENV_CONSTANTS = 3
 	};
 
-	struct JitSlot {
-		Variant::Type type = Variant::NIL;
+	static constexpr bjit::Value jit_sp { 0 };
+	static constexpr unsigned _variant_data_field_offset = sizeof(uint64_t);
+
+	struct ValueReference {
 		bjit::Value ptr{0};
-		bjit::Value data_ptr{0};
+		bjit::Value cached{0};
 
-		JitSlot(const Variant::Type p_type) : type(p_type) {}
+		Variant::Type type = Variant::VARIANT_MAX;
+	
+		int index = -1;
 
-		_FORCE_INLINE_ bool is_primitive() const {
-			switch (type) {
-				case Variant::BOOL:
-				case Variant::INT:
-				case Variant::FLOAT:
-					return true;
-				default:
-					return false;
-			}
+		union {
+			// For constants
+			const Variant* constant;
+
+			// For locals
+			enum : uint8_t {
+				UNCHANGED = 0,
+				VALUE_CHANGED,
+				TYPE_CHANGED,
+			} is_changed;
+		};
+
+		ValueReference() = default;
+		ValueReference(const Variant::Type p_type) : type(p_type) {}
+		ValueReference(const Variant& p_constant) :
+				type(p_constant.get_type()), constant(&p_constant) {}
+
+		_FORCE_INLINE_ bool is_cached() const {
+			return cached.index != 0;
+		}
+
+		_FORCE_INLINE_ bool is_ptr_cached() const {
+			return ptr.index != 0;
+		}
+
+		_FORCE_INLINE_ bool has_type() const {
+			return type != Variant::VARIANT_MAX;
 		}
 
 		_FORCE_INLINE_ bool is_allocated() const {
-			return ptr.index != 0;
+			return index >= 0;
 		}
-	};
 
-	struct ConstantSlot : public JitSlot {
-		const Variant* value;
-
-		bjit::Value imm{0};
-		int array_pos = -1;
-
-		ConstantSlot(const Variant::Type p_type, const Variant* p_value) :
-				JitSlot(p_type), value(p_value) {}
-
-		_FORCE_INLINE_ bool is_used_by_ptr() const {
-			return is_allocated();
+		_FORCE_INLINE_ void drop_cache() {
+			is_changed = UNCHANGED;
+			cached.index = 0;
 		}
-	};
 
-	struct StackSlot : public JitSlot {
-		int stack_pos = -1;
-		bool can_contain_object = true;
+		_FORCE_INLINE_ void reuse(const Variant::Type new_type) {
+			is_changed = (new_type != type) ? TYPE_CHANGED : UNCHANGED;
 
-		StackSlot(const Variant::Type p_type, bool p_can_contain_obj) :
-				JitSlot(p_type), can_contain_object(p_can_contain_obj) {}
+			type = new_type;
+			cached.index = 0;
+		}
+
+		// The value is assumed to be constant of primitive type.
+		bjit::Value _emit_load_constant(bjit::Proc& proc) {
+			DEV_ASSERT(is_primitive_type(type));
+			const Variant* variant = constant;
+
+			switch(variant->get_type()) {
+				case Variant::BOOL:
+					cached = proc.lcu(variant->operator bool());
+					break;
+				case Variant::INT:
+					cached = proc.lci(variant->operator int64_t());
+					break;
+				case Variant::FLOAT:
+					cached = proc.lcd(variant->operator double());
+					break;
+				default:
+					cached = proc.lci(0);
+					break;
+			}
+
+			return cached;
+		}
+
+		// The value is assumed to be local of primitive type.
+		bjit::Value _emit_load_from_memory(bjit::Proc& proc) {
+			DEV_ASSERT(is_primitive_type(type));
+			const unsigned data_offset = (index * sizeof(Variant)) + _variant_data_field_offset;
+
+			switch(constant->get_type()) {
+				case Variant::BOOL:
+					cached = proc.li8(jit_sp, data_offset);
+					break;
+				case Variant::FLOAT:
+					cached = proc.lf64(jit_sp, data_offset);
+					break;
+				default:
+					cached = proc.li64(jit_sp, data_offset);
+					break;
+			}
+
+			is_changed = UNCHANGED;
+			return cached;
+		}
 	};
 
 	using ProcFunction = void (Variant*,Variant*,const Variant**,Variant*);
 
-	static constexpr bjit::Value jit_sp { 0 };
-
 	GDScriptFunction *function;
 
 	bjit::Module jit_module;
-	Vector<bjit::Proc> jit_procs;
-	bjit::Proc* proc;
+	bjit::Proc proc;
 
 	List<RBMap<StringName, int>> stack_id_stack;
 	RBMap<StringName, int> stack_identifiers;
 	List<int> stack_identifiers_counts;
 	RBMap<StringName, int> local_constants;
 
-	Vector<StackSlot> locals;
+	Vector<ValueReference> locals;
 	HashSet<int> dirty_locals;
 
-	Vector<StackSlot> temporaries;
-	List<int> used_temporaries;
-	HashSet<int> temporaries_pending_clear;
-	RBMap<Variant::Type, List<int>> temporaries_pool;
+	Vector<int> temporaries;
+	Vector<int> temporaries_pool;
 
-	Vector<ConstantSlot> constants;
+	Vector<ValueReference> constants;
+
 	HashMap<Variant, int, VariantHasher, VariantComparator> constant_map;
 	RBMap<StringName, int> name_map;
 	RBMap<Variant::ValidatedOperatorEvaluator, int> operator_func_map;
@@ -159,112 +211,124 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
-	_FORCE_INLINE_ void _allocate_stack_slot(StackSlot& slot) {
-		slot.stack_pos = stack_alloc_idx();
-		slot.ptr = proc->iadd(jit_sp, proc->lcu(sizeof(Variant) * slot.stack_pos));
-	}
-
-	_FORCE_INLINE_ void _allocate_constant_slot(ConstantSlot& slot) {
-		slot.array_pos = constant_alloc_idx();
-		slot.ptr = proc->iadd(proc->env[ENV_CONSTANTS], proc->lcu(sizeof(Variant) * slot.array_pos));
-	}
-
-	bjit::Value get_jit_ptr(StackSlot& slot) {
-		if (!slot.is_allocated()) _allocate_stack_slot(slot);
-		return slot.ptr;
-	}
-
-	bjit::Value get_jit_ptr(ConstantSlot& slot) {
-		if (!slot.is_allocated()) _allocate_constant_slot(slot);
-		return slot.ptr;
-	}
-
-	static constexpr unsigned _variant_data_field_offset = sizeof(uint64_t);
-
-	bjit::Value get_jit_data_ptr(StackSlot& slot) {
-		if (!slot.data_ptr.index) {
-			if (!slot.is_allocated()) _allocate_stack_slot(slot);
-
-			slot.data_ptr = proc->iadd(
-				jit_sp,
-				proc->lci((sizeof(Variant) * slot.stack_pos) + _variant_data_field_offset)
-			);
-		}
-
-		return slot.data_ptr;
-	}
-
-	bjit::Value get_jit_data_ptr(ConstantSlot& slot) {
-		if (!slot.data_ptr.index) {
-			if (!slot.is_allocated()) _allocate_constant_slot(slot);
-
-			slot.data_ptr = proc->iadd(
-				proc->env[ENV_CONSTANTS],
-				proc->lci((sizeof(Variant) * slot.array_pos) + _variant_data_field_offset)
-			);
-		}
-	}
-
-	bjit::Value get_jit_imm(ConstantSlot& slot) {
-		if (!slot.imm.index) {
-			switch (slot.type) {
-				case Variant::BOOL:
-					slot.imm = proc->lcu(slot.value->operator bool());
-					break;
-				case Variant::INT:
-					slot.imm = proc->lci(slot.value->operator int64_t());
-					break;
-				case Variant::FLOAT:
-					slot.imm = proc->lcd(slot.value->operator double());
-					break;
-				default:
-					slot.imm = proc->lci(0);
-					break;
-			}
-		}
-
-		return slot.imm;
-	}
-
-	bjit::Value get_jit_data(const Address& object_addr) {
-		StackSlot* slot;
-
-		switch (object_addr.mode) {
-			case Address::CONSTANT:
-				return get_jit_imm(constants.write[object_addr.address]);
-				break;
+	ValueReference& get_value_ref(const Address& p_address) {
+		switch (p_address.mode) {
 			case Address::FUNCTION_PARAMETER:
 			case Address::LOCAL_VARIABLE:
-				slot = &locals.write[object_addr.address];
-				break;
 			case Address::TEMPORARY:
-				slot = &temporaries.write[object_addr.address];
+				return locals.write[p_address.address];
+				break;
+			case Address::CONSTANT:
+				return constants.write[p_address.address];
 				break;
 			default:
-				ERR_FAIL_V_MSG(proc->lci(0), "Incompatible address used for obtaining variant data");
+				ERR_PRINT("Unsupported address mode while code generating");
+				break;
+		}
+	}
+
+	void temp() {
+	}
+
+	template<typename R, typename... FuncArgs, typename... JitArgs>
+	void emit_function_call(R (*func_ptr)(FuncArgs...), JitArgs... jit_args) {
+		static_assert(sizeof...(FuncArgs) == sizeof...(JitArgs));
+		constexpr unsigned args_count = sizeof...(FuncArgs);
+
+		if constexpr (args_count > 0) {
+			proc.env.reserve(proc.env.size() + args_count);
+			(proc.env.push_back(jit_args),...)
+		}
+
+		proc.icallp(proc.lcu((uintptr_t)func_ptr), args_count);
+
+		if constexpr (args_count > 0) {
+			proc.env.resize(proc.env.size() - args_count);
+		}
+	}
+
+	// The value is assumed to be of primitive type.
+	bjit::Value emit_data_load(ValueReference& p_value, const Address& p_address) {
+		DEV_ASSERT(is_primitive_type(p_value.type));
+
+		// Check cached immediate or loaded from memory value.
+		if (p_value.is_cached()) return p_value.cached;
+
+		if (p_address.mode == Address::CONSTANT) {
+			// Load immediate value.
+			return p_value._emit_load_constant(proc);
+		} else if (p_value.is_allocated()) {
+			return p_value._emit_load_from_memory(proc);
+		}
+
+		// Invalid case
+		ERR_FAIL_V_MSG(proc.lci(0), "Trying to load data from memory of non-allocated local.");
+	}
+
+	// The value is assumed to be a local of primitive type.
+	void emit_data_store(const Address& dst_addr, const Variant::Type src_type, const bjit::Value jit_value) {
+		DEV_ASSERT(dst_addr.mode == Address::TEMPORARY || dst_addr.mode == Address::LOCAL_VARIABLE);
+		DEV_ASSERT(is_primitive_type(src_type));
+
+		ValueReference& dst = locals.write[dst_addr.address];
+
+		// Lazy: storing will be emitted only if a pointer to the value is accessed.
+		dst.is_changed = (dst.type != src_type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED;
+
+		dst.type = src_type;
+		dst.cached = jit_value;
+	}
+
+	bjit::Value emit_ptr_access(const Address& address) {
+		if (address.mode == Address::CONSTANT) {
+			ValueReference& value = constants.write[address.address];
+
+			if (value.is_ptr_cached()) return value.ptr;
+			DEV_ASSERT(value.is_allocated() == false);
+
+			value.index = constant_alloc_idx();
+			value.ptr = proc.iadd(proc.env[ENV_CONSTANTS], proc.lcu(value.index * sizeof(Variant)));
+
+			return value.ptr;
+		}
+
+		ValueReference& value = locals.write[address.address];
+
+		if (!value.is_ptr_cached()) {
+			DEV_ASSERT(value.is_allocated() == false);
+			value.index = stack_alloc_idx();
+			value.ptr = proc.iadd(jit_sp, proc.lcu(value.index * sizeof(Variant)));
+		}
+
+		const unsigned _data_offset = (value.index * sizeof(Variant)) + _variant_data_field_offset;
+
+		// Lazy storing if needed.
+		switch (value.is_changed) {
+			// Emit type field assign with falling to value assign.
+			case ValueReference::TYPE_CHANGED:
+				proc.si8(proc.lcu(value.type), jit_sp, (value.index * sizeof(Variant)));
+			// Emit value assign.
+			case ValueReference::VALUE_CHANGED:
+				if (value.is_cached()) {
+					switch (value.type) {
+						case Variant::BOOL:
+							proc.si8(value.cached, jit_sp, _data_offset);
+							break;
+						case Variant::FLOAT:
+							proc.sf64(value.cached, jit_sp, _data_offset);
+							break;
+						default:
+							proc.si64(value.cached, jit_sp, _data_offset);
+							break;
+					}
+				}
+				value.is_changed = ValueReference::UNCHANGED;
+				break;
+			case ValueReference::UNCHANGED:
 				break;
 		}
 
-		bjit::Value ptr = get_jit_ptr(*slot);
-
-		switch (slot->type) {
-			case Variant::BOOL:
-				return proc->li8(ptr, _variant_data_field_offset);
-				break;
-			case Variant::INT:
-			case Variant::VECTOR2:
-			case Variant::VECTOR2I:
-				return proc->li64(ptr, _variant_data_field_offset);
-				break;
-			case Variant::FLOAT:
-				return proc->lf64(ptr, _variant_data_field_offset);
-				break;
-			default:
-				break;
-		}
-
-		ERR_PRINT("Invalid variant type found while obtaining variant._data");
-		return proc->lci(0);
+		return value.ptr;
 	}
 
 	void add_stack_identifier(const StringName &p_id, int p_stackpos) {
@@ -306,7 +370,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			return constant_map[p_constant];
 		}
 		int idx = constants.size();
-		constants.push_back(ConstantSlot(p_constant.get_type(), &p_constant));
+		constants.push_back(ValueReference(p_constant));
 		constant_map[p_constant] = idx;
 		return idx;
 	}

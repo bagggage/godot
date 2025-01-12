@@ -42,6 +42,114 @@ static _FORCE_INLINE_ bool is_primitive_type(const Variant::Type variant_type) {
 	);
 }
 
+static void _method_bind_validated_call_wrapper(
+	const MethodBind* method, Object* p_object, const Variant** p_args, Variant* r_ret
+) {
+	method->validated_call(p_object, p_args, r_ret);
+
+	//print_line("validated call ret:", Variant::get_type_name(r_ret->get_type()), r_ret->stringify());
+}
+
+static void _variant_get_named_wrapper(const Variant* variant, Variant* dst, const StringName& p_member) {
+	bool valid;
+	*dst = variant->get_named(p_member, valid);
+
+	//print_line("getted member:", Variant::get_type_name(dst->get_type()), dst->stringify());
+
+	(void)valid;
+}
+
+static void _variant_set_named_wrapper(Variant* variant, const Variant& p_value, const StringName& p_member) {
+	bool valid;
+	variant->set_named(p_member, p_value, valid);
+
+	//print_line("getted member:", Variant::get_type_name(dst->get_type()), dst->stringify());
+
+	(void)valid;
+}
+
+using VariantConstructWrapper = void (*)(Variant&, const Variant**, int);
+
+template<Variant::Type t>
+static void _variant_construct_wrapper_impl(Variant& base, const Variant** argptrs, int args_count) {
+	Callable::CallError error;
+	Variant::construct(t, base, argptrs, args_count, error);
+
+	//print_line("constructed:", Variant::get_type_name(base.get_type()), base.stringify());
+
+	(void)error;
+}
+
+static void _variant_call_utility_function_wrapper(
+	const StringName& p_name, Variant* r_ret, const Variant** p_args, int args_count
+) {
+	Callable::CallError error;
+	Variant::call_utility_function(p_name, r_ret, p_args, args_count, error);
+
+	(void)error;
+}
+
+static VariantConstructWrapper _get_variant_construct_wrapper(const Variant::Type t) {
+	static constexpr VariantConstructWrapper wrappers_table[Variant::Type::VARIANT_MAX] = {
+		_variant_construct_wrapper_impl<Variant::Type::NIL>,
+
+		_variant_construct_wrapper_impl<Variant::Type::BOOL>,
+		_variant_construct_wrapper_impl<Variant::Type::INT>,
+		_variant_construct_wrapper_impl<Variant::Type::FLOAT>,
+		_variant_construct_wrapper_impl<Variant::Type::STRING>,
+
+		_variant_construct_wrapper_impl<Variant::Type::VECTOR2>,
+		_variant_construct_wrapper_impl<Variant::Type::VECTOR2I>,
+		_variant_construct_wrapper_impl<Variant::Type::RECT2>,
+		_variant_construct_wrapper_impl<Variant::Type::RECT2I>,
+		_variant_construct_wrapper_impl<Variant::Type::VECTOR3>,
+		_variant_construct_wrapper_impl<Variant::Type::VECTOR3I>,
+		_variant_construct_wrapper_impl<Variant::Type::TRANSFORM2D>,
+		_variant_construct_wrapper_impl<Variant::Type::VECTOR4>,
+		_variant_construct_wrapper_impl<Variant::Type::VECTOR4I>,
+		_variant_construct_wrapper_impl<Variant::Type::PLANE>,
+		_variant_construct_wrapper_impl<Variant::Type::QUATERNION>,
+		_variant_construct_wrapper_impl<Variant::Type::AABB>,
+		_variant_construct_wrapper_impl<Variant::Type::BASIS>,
+		_variant_construct_wrapper_impl<Variant::Type::TRANSFORM3D>,
+		_variant_construct_wrapper_impl<Variant::Type::PROJECTION>,
+
+		_variant_construct_wrapper_impl<Variant::Type::COLOR>,
+		_variant_construct_wrapper_impl<Variant::Type::STRING_NAME>,
+		_variant_construct_wrapper_impl<Variant::Type::NODE_PATH>,
+		_variant_construct_wrapper_impl<Variant::Type::RID>,
+		_variant_construct_wrapper_impl<Variant::Type::OBJECT>,
+		_variant_construct_wrapper_impl<Variant::Type::CALLABLE>,
+		_variant_construct_wrapper_impl<Variant::Type::SIGNAL>,
+		_variant_construct_wrapper_impl<Variant::Type::DICTIONARY>,
+		_variant_construct_wrapper_impl<Variant::Type::ARRAY>,
+
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_BYTE_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_INT32_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_INT64_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_FLOAT32_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_FLOAT64_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_STRING_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_VECTOR2_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_VECTOR3_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_COLOR_ARRAY>,
+		_variant_construct_wrapper_impl<Variant::Type::PACKED_VECTOR4_ARRAY>
+	};
+
+	return wrappers_table[(unsigned)t];
+}
+
+static void _variant_evaluate_wrapper(const Variant::Operator op, const Variant& left, const Variant& right, Variant& result) {
+	bool valid;
+	Variant::evaluate(op, left, right, result, valid);
+
+	(void)valid;
+}
+
+static void _variant_assign_wrapper(Variant* destination, const Variant* source) {
+	*destination = *source;
+}
+
 uint32_t GDScriptJitCodeGenerator::add_parameter(const StringName &p_name, bool p_is_optional, const GDScriptDataType &p_type) {
 	function->_argument_count++;
 	function->argument_types.push_back(p_type);
@@ -53,10 +161,9 @@ uint32_t GDScriptJitCodeGenerator::add_parameter(const StringName &p_name, bool 
 }
 
 uint32_t GDScriptJitCodeGenerator::add_local(const StringName &p_name, const GDScriptDataType &p_type) {
-	StackSlot slot(p_type.builtin_type, p_type.can_contain_object());
 	int index = locals.size();
 
-	locals.push_back(slot);
+	locals.push_back(ValueReference(p_type.has_type ? p_type.builtin_type : Variant::VARIANT_MAX));
 	add_stack_identifier(p_name, index);
 
 	return index;
@@ -77,92 +184,69 @@ uint32_t GDScriptJitCodeGenerator::add_or_get_name(const StringName &p_name) {
 }
 
 uint32_t GDScriptJitCodeGenerator::add_temporary(const GDScriptDataType &p_type) {
-	Variant::Type temp_type = Variant::NIL;
-	if (p_type.has_type && p_type.kind == GDScriptDataType::BUILTIN) {
-		switch (p_type.builtin_type) {
-			case Variant::NIL:
-			case Variant::BOOL:
-			case Variant::INT:
-			case Variant::FLOAT:
-			case Variant::STRING:
-			case Variant::VECTOR2:
-			case Variant::VECTOR2I:
-			case Variant::RECT2:
-			case Variant::RECT2I:
-			case Variant::VECTOR3:
-			case Variant::VECTOR3I:
-			case Variant::TRANSFORM2D:
-			case Variant::VECTOR4:
-			case Variant::VECTOR4I:
-			case Variant::PLANE:
-			case Variant::QUATERNION:
-			case Variant::AABB:
-			case Variant::BASIS:
-			case Variant::TRANSFORM3D:
-			case Variant::PROJECTION:
-			case Variant::COLOR:
-			case Variant::STRING_NAME:
-			case Variant::NODE_PATH:
-			case Variant::RID:
-			case Variant::CALLABLE:
-			case Variant::SIGNAL:
-				temp_type = p_type.builtin_type;
+	const Variant::Type temp_type = p_type.has_type ? p_type.builtin_type : Variant::VARIANT_MAX;
+	int index = -1;
+
+	if (temporaries_pool.is_empty()) {
+		index = locals.size();
+		locals.push_back(ValueReference(temp_type));
+	} else {
+		int nil_i = -1;
+		int primitive_i = -1;
+
+		for (int i = 0; i < temporaries_pool.size(); ++i) {
+			int temp_idx = temporaries_pool[i];
+			const ValueReference& candidate = locals[temp_idx];
+
+			if (candidate.type == temp_type) {
+				index = temp_idx;
+				temporaries_pool.remove_at(i);
 				break;
-			case Variant::OBJECT:
-			case Variant::DICTIONARY:
-			case Variant::ARRAY:
-			case Variant::PACKED_BYTE_ARRAY:
-			case Variant::PACKED_INT32_ARRAY:
-			case Variant::PACKED_INT64_ARRAY:
-			case Variant::PACKED_FLOAT32_ARRAY:
-			case Variant::PACKED_FLOAT64_ARRAY:
-			case Variant::PACKED_STRING_ARRAY:
-			case Variant::PACKED_VECTOR2_ARRAY:
-			case Variant::PACKED_VECTOR3_ARRAY:
-			case Variant::PACKED_COLOR_ARRAY:
-			case Variant::PACKED_VECTOR4_ARRAY:
-			case Variant::VARIANT_MAX:
-				// Arrays, dictionaries, and objects are reference counted, so we don't use the pool for them.
-				temp_type = Variant::NIL;
-				break;
+			} else if (candidate.type == Variant::NIL) {
+				nil_i = i;
+			} else if (is_primitive_type(candidate.type)) {
+				primitive_i = i;
+			}
+		}
+
+		if (index >= 0) {
+			locals.write[index].drop_cache();
+		}
+		// In case if there is no suitable candidate of the same type.
+		else if (nil_i >= 0) {
+			index = temporaries_pool[nil_i];
+			temporaries_pool.remove_at(nil_i);
+			locals.write[index].reuse(temp_type);
+		} else if (primitive_i >= 0) {
+			index = temporaries_pool[primitive_i];
+			temporaries_pool.remove_at(primitive_i);
+			locals.write[index].reuse(temp_type);
+		} else {
+			index = locals.size();
+			locals.push_back(ValueReference(temp_type));
 		}
 	}
 
-	if (!temporaries_pool.has(temp_type)) {
-		temporaries_pool[temp_type] = List<int>();
-	}
-
-	List<int> &pool = temporaries_pool[temp_type];
-	int slot;
-
-	if (pool.is_empty()) {
-		StackSlot new_temp(temp_type, p_type.can_contain_object());
-		slot = temporaries.size();
-
-		pool.push_back(slot);
-		temporaries.push_back(new_temp);
-	} else {
-		slot = pool.front()->get();
-		pool.pop_front();
-	}
-
-	used_temporaries.push_back(slot);
-	return slot;
+	temporaries.push_back(index);
+	return index;
 }
 
 void GDScriptJitCodeGenerator::pop_temporary() {
-	ERR_FAIL_COND(used_temporaries.is_empty());
-	int slot_idx = used_temporaries.back()->get();
+	ERR_FAIL_COND(temporaries.is_empty());
+	int value_idx = temporaries[temporaries.size() - 1];
 
-	if (temporaries[slot_idx].can_contain_object) {
-		// Avoid keeping in the stack long-lived references to objects,
-		// which may prevent `RefCounted` objects from being freed.
-		// However, the cleanup will be performed an the end of the
-		// statement, to allow object references to survive chaining.
-		temporaries_pending_clear.insert(slot_idx);
+	ValueReference& value = locals.write[value_idx];
+	if (value.has_type()) {
+		// TODO: Free temporaties that can contains object.
 	}
-	temporaries_pool[temporaries[slot_idx].type].push_back(slot_idx);
-	used_temporaries.pop_back();
+
+	if (value.is_allocated()) {
+		temporaries_pool.push_back(value_idx);
+	} else if (value_idx == locals.size() - 1) {
+		locals.remove_at(value_idx);
+	}
+
+	temporaries.remove_at(temporaries.size() - 1);
 }
 
 void GDScriptJitCodeGenerator::start_parameters() {
@@ -191,6 +275,33 @@ void GDScriptJitCodeGenerator::write_start(GDScript *p_script, const StringName 
 }
 
 GDScriptFunction *GDScriptJitCodeGenerator::write_end() {
+	// Setup stacks size.
+	proc.getOps()[0].imm32 = stack_top * sizeof(Variant);
+
+	// Compile and debug.
+	{
+		std::vector<uint8_t> bytes;
+		proc.compile(bytes, 2);
+
+		String text;
+		for (auto byte : bytes) {
+			text += vformat("%02x ", byte);
+		}
+		print_line(""); print_line(text);
+	}
+
+	function->_stack_size = stack_top;
+
+	// Fill constants.
+	function->constants.resize(constants_top);
+	for (auto& constant : constants) {
+		if (!constant.is_allocated()) continue;
+
+		function->constants.write[constant.index] = *constant.constant;
+	}
+	function->_constants_ptr = function->constants.ptrw();
+	function->_constant_count = constants_top;
+
 	return function;
 }
 
@@ -211,41 +322,100 @@ void GDScriptJitCodeGenerator::set_initial_line(int p_line) {
 	(m_var.type.has_type && m_var.type.kind == GDScriptDataType::BUILTIN && m_var.type.builtin_type == m_type && m_type != Variant::NIL)
 
 void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Variant::Type p_new_type) {
+	// 1. TODO: Destruct previouse value if needed;
+	// 2. TODO: Construct new value if needed;
+	// 3. Change `type` field.
+
+	ValueReference& value = get_value_ref(p_target);
+	bjit::Value jit_ptr = emit_ptr_access(p_target);
+
+	if (value.has_type()) {
+		// Change `type` field.
+		proc.si8(proc.lci(p_new_type), jit_ptr, 0);
+	} else {
+		emit_function_call(
+			VariantInternal::initialize,
+			jit_ptr,
+			proc.lci(p_new_type)
+		);
+	}
 }
 
 void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand) {
-	if (HAS_BUILTIN_TYPE(p_left_operand)) {
-		// Gather specific operator.
-		Variant::Type operand_type = p_left_operand.type.builtin_type;
-		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand_type, Variant::NIL);
+	ValueReference& operand = get_value_ref(p_left_operand);
+	Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type, Variant::NIL);
 
-		if (is_primitive_type(operand_type)) {
-			bjit::Value jit_value = get_jit_data(p_left_operand);
-			
+	print_line("unary operator:", Variant::get_operator_name(p_operator), "for type:", Variant::get_type_name(operand.type));
 
-			switch (operand_type) {
-				case Variant::OP_BIT_NEGATE:
-					 proc->ineg(jit_value);
-					break;
-				case Variant::OP_NEGATE:
-					break;
-				case Variant::OP_POSITIVE:
-					break;
-				case Variant::OP_NOT:
-					//proc->bc
-					break;
-				default:
-					break;
-			}
+	if (is_primitive_type(operand.type)) {
+		print_line("\tprimitive evaluation!");
+
+		bjit::Value jit_value = emit_data_load(operand, p_left_operand);
+
+		switch (operand.type) {
+			case Variant::OP_BIT_NEGATE:
+				jit_value = proc.inot(jit_value);
+				break;
+			case Variant::OP_NEGATE:
+				if (operand.type == Variant::FLOAT)
+					jit_value = proc.fneg(jit_value);
+				else
+					jit_value = proc.ineg(jit_value);
+				break;
+			case Variant::OP_POSITIVE:
+				// Do nothing here?
+				break;
+			case Variant::OP_NOT:
+				// Cast to boolean?
+				if (operand.type == Variant::FLOAT)
+					jit_value = proc.feq(jit_value, proc.lcf(0));
+				else
+					jit_value = proc.ieq(jit_value, proc.lci(0));
+				break;
+			default:
+				break;
 		}
 
-		//append_opcode(GDScriptFunction::OPCODE_OPERATOR_VALIDATED);
-		//append(p_left_operand);
-		//append(Address());
-		//append(p_target);
-		//append(op_func);
+		emit_data_store(p_target, ret_type, jit_value);
 		return;
 	}
+
+	bjit::Value jit_operand_ptr = emit_ptr_access(p_left_operand);
+	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+
+	if (operand.has_type()) {
+		Variant::ValidatedOperatorEvaluator op_func = Variant::get_validated_operator_evaluator(p_operator, operand.type, Variant::NIL);
+		if (op_func) {
+			print_line("\tvalidated operator");
+			emit_function_call(
+				op_func,
+				jit_operand_ptr,
+				proc.lci(0),
+				jit_target_ptr
+			);
+			return;
+		}
+
+		Variant::PTROperatorEvaluator ptr_op_func = Variant::get_ptr_operator_evaluator(p_operator, operand.type, Variant::NIL);
+		if (ptr_op_func) {
+			print_line("\tpointer operator");
+			emit_function_call(
+				op_func,
+				jit_operand_ptr,
+				proc.lci(0),
+				jit_target_ptr
+			);
+			return;
+		}
+	}
+
+	print_line("\tdynamic evaluation");
+	emit_function_call(
+		_variant_evaluate_wrapper,
+		jit_operand_ptr,
+		proc.lci(0),
+		jit_target_ptr
+	);
 }
 
 void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand, const Address &p_right_operand) {
@@ -315,6 +485,23 @@ void GDScriptJitCodeGenerator::write_assign_with_conversion(const Address &p_tar
 }
 
 void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Address &p_source) {
+	ValueReference& source = get_value_ref(p_source);
+
+	print_line("assign for: ", source.type);
+
+	if (is_primitive_type(source.type)) {
+		print_line("\tprimitive!");
+		bjit::Value jit_value = emit_data_load(source, p_source);
+		emit_data_store(p_target, source.type, jit_value);
+		return;
+	}
+
+	print_line("\twrapper call");	
+	emit_function_call(
+		_variant_assign_wrapper,
+		emit_ptr_access(p_target),
+		emit_ptr_access(p_source)
+	);
 }
 
 void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
@@ -453,6 +640,7 @@ void GDScriptJitCodeGenerator::write_newline(int p_line) {
 }
 
 void GDScriptJitCodeGenerator::write_return(const Address &p_return_value) {
+	proc.iret(proc.lci(0));
 }
 
 void GDScriptJitCodeGenerator::write_assert(const Address &p_test, const Address &p_message) {
@@ -465,14 +653,7 @@ void GDScriptJitCodeGenerator::end_block() {
 }
 
 void GDScriptJitCodeGenerator::clear_temporaries() {
-	for (int slot_idx : temporaries_pending_clear) {
-		// The temporary may have been reused as something else since it was added to the list.
-		// In that case, there's **no** need to clear it.
-		if (temporaries[slot_idx].can_contain_object) {
-			clear_address(Address(Address::TEMPORARY, slot_idx)); // Can contain `RefCounted`, so clear it.
-		}
-	}
-	temporaries_pending_clear.clear();
+	// TODO
 }
 
 void GDScriptJitCodeGenerator::clear_address(const Address &p_address) {
