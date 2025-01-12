@@ -41,7 +41,8 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	enum Environment {
 		ENV_INSTANCE = 0,
 		ENV_MEMBERS = 1,
-		ENV_CONSTANTS = 2
+		ENV_CONSTANTS = 2,
+		ENV_FUNC_ARGS = 3
 	};
 
 	static constexpr bjit::Value jit_sp { 0 };
@@ -72,8 +73,8 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		};
 
 		ValueReference() = default;
-		ValueReference(const Variant::Type p_type) :
-				type(p_type), is_changed(TYPE_CHANGED) {}
+		ValueReference(const Variant::Type p_type, bool is_preloaded = false) :
+				type(p_type), is_changed(is_preloaded ? UNCHANGED : TYPE_CHANGED) {}
 		ValueReference(const Variant& p_constant) :
 				type(p_constant.get_type()), constant(&p_constant) {}
 
@@ -130,34 +131,49 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			return cached;
 		}
 
+		void _load_primitive_from_mem(bjit::Proc& proc, bjit::Value jit_ptr, unsigned offset) {
+			switch(type) {
+				case Variant::BOOL:
+					cached = proc.li8(jit_ptr, offset);
+					break;
+				case Variant::FLOAT:
+					cached = proc.lf64(jit_ptr, offset);
+					break;
+				default:
+					cached = proc.li64(jit_ptr,  offset);
+					break;
+			}
+		}
+
+		// The value is assumed to be argument of primitive type.
+		bjit::Value _emit_load_argument(bjit::Proc& proc, int index) {
+			DEV_ASSERT(is_primitive_type(type));
+			if (!is_ptr_cached()) {
+				ptr = proc.li64(proc.env[ENV_FUNC_ARGS], index * sizeof(Variant*));
+			}
+
+			_load_primitive_from_mem(proc, ptr, _variant_data_field_offset);
+			return cached;
+		}
+
 		// The value is assumed to be local of primitive type.
-		bjit::Value _emit_load_from_memory(bjit::Proc& proc) {
+		bjit::Value _emit_load_local(bjit::Proc& proc) {
 			DEV_ASSERT(is_primitive_type(type));
 			const unsigned data_offset = (index * sizeof(Variant)) + _variant_data_field_offset;
 
-			switch(type) {
-				case Variant::BOOL:
-					cached = proc.li8(jit_sp, data_offset);
-					break;
-				case Variant::FLOAT:
-					cached = proc.lf64(jit_sp, data_offset);
-					break;
-				default:
-					cached = proc.li64(jit_sp, data_offset);
-					break;
-			}
+			_load_primitive_from_mem(proc, jit_sp, data_offset);
 
 			is_changed = UNCHANGED;
 			return cached;
 		}
 	};
 
-	using ProcFunction = void (Object*,Variant*,const Variant*);
+	using ProcFunction = void (Object*,Variant*,const Variant*,const Variant**);
 
 	GDScriptFunction *function;
 
 	bjit::Module jit_module;
-	bjit::Proc proc = bjit::Proc(0, "iii");
+	bjit::Proc proc = bjit::Proc(0, "iiii");
 
 	List<RBMap<StringName, int>> stack_id_stack;
 	RBMap<StringName, int> stack_identifiers;
@@ -171,6 +187,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	Vector<int> temporaries_pool;
 
 	Vector<ValueReference> constants;
+	Vector<ValueReference> arguments;
 
 	HashMap<Variant, int, VariantHasher, VariantComparator> constant_map;
 	RBMap<StringName, int> name_map;
@@ -239,9 +256,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
-	void temp() {
-	}
-
 	template<typename R, typename... FuncArgs, typename... JitArgs>
 	void emit_function_call(R (*func_ptr)(FuncArgs...), JitArgs... jit_args) {
 		static_assert(sizeof...(FuncArgs) == sizeof...(JitArgs));
@@ -270,11 +284,12 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			// Load immediate value.
 			print_line("load imm -> constant(", p_address.address, "):", Variant::get_type_name(p_value.type));
 			return p_value._emit_load_constant(proc);
+		} else if (p_address.mode == Address::FUNCTION_PARAMETER) {
+			print_line("load mem -> argument(", p_address.address, "):", Variant::get_type_name(p_value.type));
+			return p_value._emit_load_argument(proc, p_address.address);
 		} else if (p_value.is_allocated()) {
 			print_line("load mem -> local(", p_address.address, "):", Variant::get_type_name(p_value.type));
-			return p_value._emit_load_from_memory(proc);
-		} else {
-			
+			return p_value._emit_load_local(proc);
 		}
 
 		// Invalid case
@@ -308,6 +323,14 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 			value.index = constant_alloc_idx();
 			value.ptr = proc.iadd(proc.env[ENV_CONSTANTS], proc.lcu(value.index * sizeof(Variant)));
+
+			return value.ptr;
+		} else if (address.mode == Address::FUNCTION_PARAMETER) {
+			ValueReference& value = arguments.write[address.address];
+			print_line("get pointer -> argument(", address.address, "):", Variant::get_type_name(value.type));
+
+			if (value.is_ptr_cached()) return value.ptr;
+			value.ptr = proc.li64(proc.env[ENV_FUNC_ARGS], address.address * sizeof(Variant*));
 
 			return value.ptr;
 		}

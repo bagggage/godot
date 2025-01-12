@@ -484,7 +484,7 @@ private:
 	Vector<MethodBind *> methods;
 	Vector<GDScriptFunction *> lambdas;
 
-	void (*_jit_function)(Object*, Variant*, const Variant*) = nullptr;
+	void (*_jit_function)(Object*, Variant*, const Variant*,const Variant**) = nullptr;
 
 	int _code_size = 0;
 	int _default_arg_count = 0;

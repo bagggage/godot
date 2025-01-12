@@ -157,7 +157,10 @@ uint32_t GDScriptJitCodeGenerator::add_parameter(const StringName &p_name, bool 
 		function->_default_arg_count++;
 	}
 
-	return add_local(p_name, p_type);
+	int index = arguments.size();
+	arguments.append(ValueReference(p_type.has_type ? p_type.builtin_type : Variant::VARIANT_MAX, true));
+
+	return index;
 }
 
 uint32_t GDScriptJitCodeGenerator::add_local(const StringName &p_name, const GDScriptDataType &p_type) {
@@ -462,7 +465,7 @@ void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Va
 		bjit::Value jit_rhs = emit_data_load(rhs, p_right_operand);
 		bjit::Value jit_result;
 
-		const bool is_float = (lhs.type == Variant::FLOAT || rhs.type == Variant::FLOAT);
+		const bool is_float = ret_type == Variant::FLOAT;
 
 		// Cast to float.
 		if (is_float) {
@@ -484,17 +487,25 @@ void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Va
 				default:
 					break;
 			}
-		} else switch (p_operator) {
-			case Variant::OP_ADD:
-				jit_result = proc.iadd(jit_lhs, jit_rhs); break;
-			case Variant::OP_SUBTRACT:
-				jit_result = proc.isub(jit_lhs, jit_rhs); break;
-			case Variant::OP_MULTIPLY:
-				jit_result = proc.imul(jit_lhs, jit_rhs); break;
-			case Variant::OP_DIVIDE:
-				jit_result = proc.idiv(jit_lhs, jit_rhs); break;	
-			default:
-				break;
+		} else {
+			if (lhs.type == Variant::FLOAT) {
+				jit_lhs = proc.cd2i(jit_lhs);
+			} else if (rhs.type == Variant::FLOAT) {
+				jit_rhs = proc.cd2i(jit_rhs);
+			}
+
+			switch (p_operator) {
+				case Variant::OP_ADD:
+					jit_result = proc.iadd(jit_lhs, jit_rhs); break;
+				case Variant::OP_SUBTRACT:
+					jit_result = proc.isub(jit_lhs, jit_rhs); break;
+				case Variant::OP_MULTIPLY:
+					jit_result = proc.imul(jit_lhs, jit_rhs); break;
+				case Variant::OP_DIVIDE:
+					jit_result = proc.idiv(jit_lhs, jit_rhs); break;	
+				default:
+					break;
+			}
 		}
 
 		emit_data_store(p_target, ret_type, jit_result);
