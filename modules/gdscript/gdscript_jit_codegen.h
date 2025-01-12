@@ -48,7 +48,15 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	static constexpr bjit::Value jit_sp { 0 };
 	static constexpr unsigned _variant_data_field_offset = sizeof(uint64_t);
 
+	static bool is_primitive_type(const Variant::Type variant_type);
+
 	struct ValueReference {
+		enum LazyState : uint8_t {
+			UNCHANGED = 0,
+			VALUE_CHANGED,
+			TYPE_CHANGED,
+		};
+
 		bjit::Value ptr{0};
 		bjit::Value cached{0};
 
@@ -61,11 +69,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			const Variant* constant;
 
 			// For locals
-			enum : uint8_t {
-				UNCHANGED = 0,
-				VALUE_CHANGED,
-				TYPE_CHANGED,
-			} is_changed;
+			LazyState is_changed;
 		};
 
 		ValueReference() = default;
@@ -151,7 +155,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	GDScriptFunction *function;
 
 	bjit::Module jit_module;
-	bjit::Proc proc;
+	bjit::Proc proc = bjit::Proc(0, "iii");
 
 	List<RBMap<StringName, int>> stack_id_stack;
 	RBMap<StringName, int> stack_identifiers;
@@ -183,7 +187,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	RBMap<GDScriptFunction *, int> lambdas_map;
 
 	int max_locals = 0;
-	int instr_args_max = 0;
 
 	int stack_top = 0;
 	int constants_top = 0;
@@ -203,7 +206,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		return constants_top++;
 	}
 
-	int stack_free_idx(int idx) {
+	void stack_free_idx(int idx) {
 		if (idx == stack_top - 1) {
 			stack_top--;
 		} else {
@@ -237,7 +240,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 		if constexpr (args_count > 0) {
 			proc.env.reserve(proc.env.size() + args_count);
-			(proc.env.push_back(jit_args),...)
+			(proc.env.push_back(jit_args),...);
 		}
 
 		proc.icallp(proc.lcu((uintptr_t)func_ptr), args_count);

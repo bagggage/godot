@@ -34,7 +34,7 @@
 
 #include "core/debugger/engine_debugger.h"
 
-static _FORCE_INLINE_ bool is_primitive_type(const Variant::Type variant_type) {
+bool GDScriptJitCodeGenerator::is_primitive_type(const Variant::Type variant_type) {
 	return (
 		variant_type == Variant::Type::BOOL ||
 		variant_type == Variant::Type::INT ||
@@ -352,7 +352,7 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 
 		bjit::Value jit_value = emit_data_load(operand, p_left_operand);
 
-		switch (operand.type) {
+		switch (p_operator) {
 			case Variant::OP_BIT_NEGATE:
 				jit_value = proc.inot(jit_value);
 				break;
@@ -412,6 +412,7 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 	print_line("\tdynamic evaluation");
 	emit_function_call(
 		_variant_evaluate_wrapper,
+		proc.lci((int64_t)p_operator),
 		jit_operand_ptr,
 		proc.lci(0),
 		jit_target_ptr
