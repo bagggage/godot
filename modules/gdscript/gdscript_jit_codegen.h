@@ -46,9 +46,21 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	};
 
 	static constexpr bjit::Value jit_sp { 0 };
+
 	static constexpr unsigned _variant_data_field_offset = sizeof(uint64_t);
+	static constexpr unsigned _object_data_ptr_field_offset = sizeof(ObjectID);
 
 	static bool is_primitive_type(const Variant::Type variant_type);
+
+	struct MemberInfo {
+		int index = -1;
+		Variant::Type type = Variant::VARIANT_MAX;
+		StringName class_name;
+
+		_FORCE_INLINE_ bool is_valid() {
+			return index >= 0;
+		}
+	};
 
 	struct ValueReference {
 		enum LazyState : uint8_t {
@@ -95,17 +107,25 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 
 		_FORCE_INLINE_ void drop_cache() {
-			is_changed = (is_changed == TYPE_CHANGED) ? TYPE_CHANGED : UNCHANGED;
+			set_changed(UNCHANGED);
 			cached.index = 0;
 		}
 
 		_FORCE_INLINE_ void reuse(const Variant::Type new_type) {
-			if (is_changed != TYPE_CHANGED) {
-				is_changed = (new_type != type) ? TYPE_CHANGED : UNCHANGED;
-			}
+			set_changed((new_type != type) ? TYPE_CHANGED : UNCHANGED);
 
 			type = new_type;
 			cached.index = 0;
+		}
+
+		_FORCE_INLINE_ void evaluate(const Variant::Type new_type) {
+			is_changed = UNCHANGED;
+			type = new_type;
+			cached.index = 0;
+		} 
+
+		_FORCE_INLINE_ void set_changed(const LazyState state) {
+			is_changed = (is_changed == TYPE_CHANGED) ? TYPE_CHANGED : state;
 		}
 
 		// The value is assumed to be constant of primitive type.
@@ -240,9 +260,39 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
+	MemberInfo get_member_info(const StringName& p_name) {
+		MemberInfo ret;
+		GDScript* script = function->get_script();
+
+		for (GDScript* base = script->get_base().ptr(); base != nullptr; script = base) {
+			if (script->debug_get_member_indices().has(p_name)) break;
+		}
+
+		if (script->debug_get_member_indices().has(p_name)) {
+			const auto& info = script->debug_get_member_indices().get(p_name);
+
+			ret.index = info.index;
+			ret.type = info.property_info.type;
+			ret.class_name = info.property_info.class_name;
+		} else if (script->get_native().ptr()) {
+			PropertyInfo info;
+			const StringName& class_name = script->get_native().ptr()->get_name();
+
+			if (ClassDB::get_property_info(class_name, p_name, &info)) {
+				ret.index = ClassDB::get_property_index(class_name, p_name);
+				ret.type = info.type;
+				ret.class_name = info.class_name;
+			}
+		}
+
+		return ret;
+	}
+
 	ValueReference& get_value_ref(const Address& p_address) {
 		switch (p_address.mode) {
 			case Address::FUNCTION_PARAMETER:
+				return arguments.write[p_address.address];
+				break;
 			case Address::LOCAL_VARIABLE:
 			case Address::TEMPORARY:
 				return locals.write[p_address.address];
@@ -304,9 +354,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		ValueReference& dst = locals.write[dst_addr.address];
 
 		// Lazy: storing will be emitted only if a pointer to the value is accessed.
-		if (dst.is_changed != ValueReference::TYPE_CHANGED) {
-			dst.is_changed = (dst.type != src_type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED;
-		}
+		dst.set_changed((dst.type != src_type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED);
 		print_line("lazy data store: local(", dst_addr.address, ")", Variant::get_type_name(dst.type), "->", Variant::get_type_name(src_type));
 
 		dst.type = src_type;
