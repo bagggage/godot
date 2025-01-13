@@ -73,7 +73,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		bjit::Value cached{0};
 
 		Variant::Type type = Variant::VARIANT_MAX;
-	
 		int index = -1;
 
 		union {
@@ -122,7 +121,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			is_changed = UNCHANGED;
 			type = new_type;
 			cached.index = 0;
-		} 
+		}
 
 		_FORCE_INLINE_ void set_changed(const LazyState state) {
 			is_changed = (is_changed == TYPE_CHANGED) ? TYPE_CHANGED : state;
@@ -474,10 +473,11 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	const StringName* get_name_ptr(const StringName& p_identifier) {
 		int pos;
 		if (!name_map.has(p_identifier)) {
-			pos = name_map.size();
+			pos = function->global_names.size();
 			name_map[p_identifier] = pos;
 
-			function->global_names.append(p_identifier);
+			function->utilities_names.append(p_identifier);
+			function->global_names.append(function->utilities_names[function->utilities_names.size() - 1]);
 		} else {
 			pos = name_map[p_identifier];
 		}

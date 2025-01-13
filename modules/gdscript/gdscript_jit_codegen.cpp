@@ -575,28 +575,43 @@ void GDScriptJitCodeGenerator::write_get(const Address &p_target, const Address 
 }
 
 void GDScriptJitCodeGenerator::write_set_named(const Address &p_target, const StringName &p_name, const Address &p_source) {
-	ValueReference& value = get_value_ref(p_target);
+	bjit::Value jit_source_ptr = emit_ptr_access(p_source);
+	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
 
-	//if (value.)
+	emit_function_call(
+		_variant_set_named_wrapper,
+		jit_target_ptr,
+		proc.lcu((uintptr_t)get_name_ptr(p_name)),
+		jit_source_ptr
+	);
 }
 
 void GDScriptJitCodeGenerator::write_get_named(const Address &p_target, const StringName &p_name, const Address &p_source) {
+	ValueReference& source = get_value_ref(p_source);
+	ValueReference& target = get_value_ref(p_target);
+
+	bjit::Value jit_source_ptr = emit_ptr_access(p_source);
+	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+
+	target.evaluate(Variant::get_member_type(source.type, p_name));
+
+	emit_function_call(
+		_variant_get_named_wrapper,
+		jit_source_ptr,
+		proc.lcu((uintptr_t)get_name_ptr(p_name)),
+		jit_target_ptr
+	);
 }
 
 void GDScriptJitCodeGenerator::write_set_member(const Address &p_value, const StringName &p_name) {
 	ValueReference& value = get_value_ref(p_value);
 
-	DEV_ASSERT(function->_script->debug_get_member_indices().has(p_name));
-
-	const auto& member_info = function->_script->debug_get_member_indices().get(p_name);
+	const MemberInfo& member_info = get_member_info(p_name);
 	const unsigned member_offset = sizeof(Variant) * member_info.index;
 
-	const GDScriptDataType& member_type = member_info.data_type;
-	Variant::Type member_variant_type = member_type.has_type ? member_type.builtin_type : Variant::VARIANT_MAX;
+	print_line("set member:", p_name, Variant::get_type_name(member_info.type));
 
-	print_line("set member:", p_name, Variant::get_type_name(member_variant_type));
-
-	if (is_primitive_type(member_variant_type) && member_variant_type == value.type) {
+	if (is_primitive_type(member_info.type) && member_info.type == value.type) {
 		unsigned member_data_offset = member_offset + _variant_data_field_offset;
 		bjit::Value jit_value = emit_data_load(value, p_value);
 
@@ -632,7 +647,7 @@ void GDScriptJitCodeGenerator::write_get_member(const Address &p_target, const S
 
 	ValueReference& target = get_value_ref(p_target);
 
-	if (is_primitive_type(member_info.type)) {
+	if (is_primitive_type(member_info.type) && member_info.index >= 0) {
 		unsigned member_data_offset = member_offset + _variant_data_field_offset;
 		target._load_primitive_from_mem(proc, proc.env[ENV_MEMBERS], member_data_offset);
 
@@ -731,17 +746,18 @@ void GDScriptJitCodeGenerator::write_call_gdscript_utility(const Address &p_targ
 }
 
 void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) {
-	print_line("utility call");
+	print_line("utility call:", p_function);
 
-	ValueReference& target = get_value_ref(p_target);
 	const StringName* name_ptr = get_name_ptr(p_function);
-
 	bool is_return = Variant::has_utility_function_return_value(p_function);
+
+	print_line("\treturns:", is_return, "target:", p_target.mode);
 
 	bjit::Value jit_target_ptr = is_return ? emit_ptr_access(p_target) : proc.lci(0);
 	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
 
 	if (is_return) {
+		ValueReference& target = get_value_ref(p_target);
 		target.evaluate(Variant::get_utility_function_return_type(p_function));
 	}
 
@@ -770,10 +786,29 @@ void GDScriptJitCodeGenerator::write_call_native_static_validated(const GDScript
 }
 
 void GDScriptJitCodeGenerator::write_call_method_bind(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
-	bjit::Value jit_target_ptr = p_method->has_return() ? emit_ptr_access(p_target) : proc.lci(0);
 	bjit::Value jit_variant_ptr = emit_ptr_access(p_base);
 	bjit::Value jit_object_ptr = proc.li64(jit_variant_ptr, _variant_data_field_offset + _object_data_ptr_field_offset);
 	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
+
+	if (p_method->has_return()) {
+		ValueReference& target = get_value_ref(p_target);
+		target.evaluate(p_method->get_return_info().type);
+	}
+
+	emit_function_call(
+		_method_bind_call_wrapper,
+		proc.lcu((uintptr_t)p_method),
+		jit_object_ptr,
+		jit_args,
+		proc.lcu(p_arguments.size())
+	);
+}
+
+void GDScriptJitCodeGenerator::write_call_method_bind_validated(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
+	bjit::Value jit_variant_ptr = emit_ptr_access(p_base);
+	bjit::Value jit_object_ptr = proc.li64(jit_variant_ptr, _variant_data_field_offset + _object_data_ptr_field_offset);
+	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
+	bjit::Value jit_target_ptr = p_method->has_return() ? emit_ptr_access(p_target) : proc.lci(0);
 
 	if (p_method->has_return()) {
 		ValueReference& target = get_value_ref(p_target);
@@ -786,20 +821,6 @@ void GDScriptJitCodeGenerator::write_call_method_bind(const Address &p_target, c
 		jit_object_ptr,
 		jit_args,
 		jit_target_ptr
-	);
-}
-
-void GDScriptJitCodeGenerator::write_call_method_bind_validated(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
-	bjit::Value jit_variant_ptr = emit_ptr_access(p_base);
-	bjit::Value jit_object_ptr = proc.li64(jit_variant_ptr, _variant_data_field_offset + _object_data_ptr_field_offset);
-	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
-
-	emit_function_call(
-		_method_bind_call_wrapper,
-		proc.lcu((uintptr_t)p_method),
-		jit_object_ptr,
-		jit_args,
-		proc.lcu(p_arguments.size())
 	);
 }
 
