@@ -1,0 +1,204 @@
+/**************************************************************************/
+/*  gdscript_jit.h                                                        */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
+#ifndef GDSCRIPT_JIT_BUILTIN_H
+#define GDSCRIPT_JIT_BUILTIN_H
+
+#include "core/variant/variant.h"
+
+#include <bjit.h>
+
+class GDScriptJit {
+public:
+	// Used for storing information about builtin types.
+	struct TypeInfo {
+		// Using to generate a code for a field access.
+		struct FieldInfo {
+			unsigned offset = 0;
+			const TypeInfo* type = nullptr;
+		};
+
+		StringName name;
+		Variant::Type variant_type = Variant::VARIANT_MAX;
+
+		HashMap<StringName, FieldInfo> fields;
+
+		_FORCE_INLINE_ bool is_native() const {
+			return variant_type > Variant::NIL && variant_type <= Variant::FLOAT;
+		}
+		_FORCE_INLINE_ bool is_builtin() const {
+			return (variant_type >= Variant::VECTOR2 && variant_type <= Variant::VECTOR4I) ||
+				variant_type == Variant::COLOR;
+		}
+		_FORCE_INLINE_ bool is_variant() const {
+			return variant_type != Variant::VARIANT_MAX;
+		}
+	};
+
+	using UnaryOperatorCodeGenFunc = bjit::Value(*)(bjit::Proc& proc, bjit::Value lhs);
+	using BinaryOperatorCodeGenFunc = bjit::Value(*)(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs);
+
+	// Layout structure used to provide meta information about godot's internal `Variant` class.
+	struct VariantLayout {
+		static constexpr unsigned _data_alignment = 8;
+		static constexpr unsigned _data_field_offset = _data_alignment;
+		static constexpr unsigned _data_field_size = sizeof(Variant) - _data_field_offset;
+
+		Variant::Type type;
+		uint8_t alignas(_data_alignment) _data[_data_field_size];
+	};
+private:
+	static UnaryOperatorCodeGenFunc unary_operators_table[Variant::VARIANT_MAX][Variant::OP_MAX];
+	static BinaryOperatorCodeGenFunc binary_operators_table[Variant::VARIANT_MAX][Variant::VARIANT_MAX][Variant::OP_MAX];
+public:
+	template<typename To, typename From>
+	static _FORCE_INLINE_ bjit::Value cast_to(bjit::Proc& proc, const bjit::Value val) {
+	    if constexpr (std::is_same_v<To, From>) {
+	        return val;
+	    }
+	    else if constexpr (std::is_same_v<To, double>) {
+	        if constexpr (std::is_integral_v<From>) return proc.ci2d(val);
+	        else if constexpr (std::is_same_v<From, float>) return proc.cf2d(val);
+	    }
+	    else if constexpr (std::is_same_v<To, float>) {
+	        if constexpr (std::is_integral_v<From>) return proc.ci2f(val);
+	        else if constexpr (std::is_same_v<From, double>) return proc.cd2f(val);
+	    }
+	    else if constexpr (std::is_integral_v<To>) {
+	        if constexpr (std::is_same_v<From, float>) return proc.cd2i(val);
+	        else if constexpr (std::is_same_v<From, float>) return proc.cf2i(val);
+	        else if constexpr (std::is_integral_v<From>) return val;
+	    }
+
+	    static_assert("Bad cast: invalid source type" && false);
+	}
+
+	template<typename T>
+	static void store_to_memory(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		static_assert("Memory store is not supported for this C++ type" && false);
+	}
+
+	template<typename T>
+	static bjit::Value load_from_memory(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		static_assert("Memory load is not supported for this C++ type" && false);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<bool>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.li8(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<uint16_t>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.lu16(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<uint32_t>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.lu32(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<uint64_t>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.li64(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<int16_t>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.li16(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<int32_t>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.li32(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<int64_t>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.li64(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<float>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.lf32(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ bjit::Value load_from_memory<double>(bjit::Proc& proc, const bjit::Value ptr, const unsigned offset) {
+		return proc.lf64(ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<bool>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si8(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<uint16_t>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si16(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<uint32_t>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si32(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<uint64_t>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si64(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<int16_t>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si16(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<int32_t>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si32(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<int64_t>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.si64(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<float>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.sf32(value, ptr, offset);
+	}
+
+	template<>
+	_FORCE_INLINE_ void store_to_memory<double>(bjit::Proc& proc, const bjit::Value value, const bjit::Value ptr, const unsigned offset) {
+		proc.sf64(value, ptr, offset);
+	}
+};
+
+#endif // GDSCRIPT_JIT_BUILTIN_H
