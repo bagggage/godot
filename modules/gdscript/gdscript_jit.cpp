@@ -99,15 +99,15 @@ static const GDScriptJit::TypeInfo* _builtin_type_info_from() {
     { #m_name, { offsetof(m_base_type,m_name), _builtin_type_info_from<decltype(m_base_type::m_name)>() } }
 
 #define _UNPACK(...) __VA_ARGS__ 
-#define BUILTIN_TYPE(m_native,m_v_type,m_fields)                              \
-    template<>                                                                \
+#define BUILTIN_TYPE(m_native,m_v_type,m_fields)                       \
+    template<>                                                         \
     const GDScriptJit::TypeInfo* _builtin_type_info_from<m_native>() { \
         static GDScriptJit::TypeInfo type_info {                       \
-            #m_native,                                                        \
-            m_v_type,                                                         \
-            { _UNPACK m_fields }                                              \
-        };                                                                    \
-        return &type_info;                                                    \
+            typeid(m_native).hash_code(),                              \
+            m_v_type,                                                  \
+            { _UNPACK m_fields }                                       \
+        };                                                             \
+        return &type_info;                                             \
     }
 
 BUILTIN_TYPE(void, Variant::NIL, ());

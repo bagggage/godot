@@ -45,7 +45,7 @@ public:
 			const TypeInfo* type = nullptr;
 		};
 
-		StringName name;
+		size_t typeid_hash;
 		Variant::Type variant_type = Variant::VARIANT_MAX;
 
 		HashMap<StringName, FieldInfo> fields;
@@ -59,6 +59,11 @@ public:
 		}
 		_FORCE_INLINE_ bool is_variant() const {
 			return variant_type != Variant::VARIANT_MAX;
+		}
+
+		template<typename T>
+		_FORCE_INLINE_ bool is_same() const {
+			return typeid(T).hash_code() == typeid_hash;
 		}
 	};
 
