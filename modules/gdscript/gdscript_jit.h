@@ -57,6 +57,7 @@ public:
 
 		template<typename T>
 		static void register_type();
+		static void register_native_operators();
 		static bool register_builtin_types();
 	public:
 		static const TypeInfo* from_variant(const Variant::Type p_type) {
@@ -77,6 +78,9 @@ public:
 		_FORCE_INLINE_ bool is_builtin() const {
 			return (variant_type >= Variant::VECTOR2 && variant_type <= Variant::VECTOR4I) ||
 				variant_type == Variant::COLOR;
+		}
+		_FORCE_INLINE_ bool is_dynamic() const {
+			return !is_native() && !is_builtin();
 		}
 		_FORCE_INLINE_ bool is_variant() const {
 			return variant_type != Variant::VARIANT_MAX;
@@ -100,7 +104,17 @@ public:
 		uint8_t alignas(_data_alignment) _data[_data_field_size];
 	};
 private:
-	static UnaryOperatorCodeGenFunc unary_operators_table[Variant::VARIANT_MAX][Variant::OP_MAX];
+	friend class TypeInfo;
+
+	enum UnaryOperator {
+		NEGATE = 0,
+		BIT_NEGATE,
+		BOOL_NOT,
+
+		UNARY_OP_MAX
+	};
+
+	static UnaryOperatorCodeGenFunc unary_operators_table[Variant::VARIANT_MAX][UNARY_OP_MAX];
 	static BinaryOperatorCodeGenFunc binary_operators_table[Variant::VARIANT_MAX][Variant::VARIANT_MAX][Variant::OP_MAX];
 public:
 	template<typename To, typename From>
