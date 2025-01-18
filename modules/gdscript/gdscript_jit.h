@@ -45,10 +45,31 @@ public:
 			const TypeInfo* type = nullptr;
 		};
 
-		size_t typeid_hash;
+		size_t typeid_hash = 0;
 		Variant::Type variant_type = Variant::VARIANT_MAX;
 
 		HashMap<StringName, FieldInfo> fields;
+	private:
+		static HashMap<Variant::Type, const TypeInfo*> variant_map;
+		static HashMap<size_t, const Variant*> typeid_map;
+
+		static bool _static_init;
+
+		template<typename T>
+		static void register_type();
+		static bool register_builtin_types();
+	public:
+		static const TypeInfo* from_variant(const Variant::Type p_type) {
+			if (!variant_map.has(p_type)) [[unlikely]] return nullptr;
+			return variant_map.get(p_type);
+		}
+
+		template<typename T>
+		static const TypeInfo* from() {
+			const size_t type_hash = typeid(T).hash_code();
+			if (!typeid_map.has(type_hash)) [[unlikely]] return nullptr;
+			return typeid_map.get(type_hash);
+		}
 
 		_FORCE_INLINE_ bool is_native() const {
 			return variant_type > Variant::NIL && variant_type <= Variant::FLOAT;
@@ -60,7 +81,6 @@ public:
 		_FORCE_INLINE_ bool is_variant() const {
 			return variant_type != Variant::VARIANT_MAX;
 		}
-
 		template<typename T>
 		_FORCE_INLINE_ bool is_same() const {
 			return typeid(T).hash_code() == typeid_hash;

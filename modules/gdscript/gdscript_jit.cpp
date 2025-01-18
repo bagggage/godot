@@ -159,6 +159,33 @@ BUILTIN_TYPE(Color, Variant::COLOR, (
     BUILTIN_FIELD(Color, a)
 ));
 
+template<typename T>
+void GDScriptJit::TypeInfo::register_type() {
+    const TypeInfo* type_info = _builtin_type_info_from<T>();
+
+    typeid_map[typeid(T).hash_code()] = type_info;
+    variant_map[type_info->variant_type] = type_info;
+}
+
+bool GDScriptJit::TypeInfo::register_builtin_types() {
+    register_type<void>();
+    register_type<bool>();
+    register_type<int32_t>();
+    register_type<int64_t>();
+    register_type<float>();
+    register_type<double>();
+    register_type<Vector2>();
+    register_type<Vector2i>();
+    register_type<Vector3>();
+    register_type<Vector3i>();
+    register_type<Vector4>();
+    register_type<Vector4i>();
+
+    return true;
+}
+
+bool GDScriptJit::TypeInfo::_static_init = GDScriptJit::TypeInfo::register_builtin_types();
+
 GDScriptJit::UnaryOperatorCodeGenFunc
 GDScriptJit::unary_operators_table[Variant::VARIANT_MAX][Variant::OP_MAX] = {
 };
