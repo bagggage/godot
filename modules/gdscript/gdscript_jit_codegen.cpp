@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  gdscript_byte_codegen.cpp                                             */
+/*  gdscript_jit_codegen.cpp                                              */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -33,14 +33,6 @@
 #include "gdscript.h"
 
 #include "core/debugger/engine_debugger.h"
-
-bool GDScriptJitCodeGenerator::is_primitive_type(const Variant::Type variant_type) {
-	return (
-		variant_type == Variant::Type::BOOL ||
-		variant_type == Variant::Type::INT ||
-		variant_type == Variant::Type::FLOAT
-	);
-}
 
 static void _method_bind_call_wrapper(
 	const MethodBind* method, Object* p_object, const Variant** p_args, int p_arg_count
@@ -168,7 +160,8 @@ uint32_t GDScriptJitCodeGenerator::add_parameter(const StringName &p_name, bool 
 	}
 
 	int index = arguments.size();
-	arguments.append(ValueReference(p_type.has_type ? p_type.builtin_type : Variant::VARIANT_MAX, true));
+	arguments.append(ValueRef(Address::FUNCTION_PARAMETER, p_type));
+	arguments.write[index].offset = sizeof(Variant*) * index;
 
 	return index;
 }
@@ -176,7 +169,7 @@ uint32_t GDScriptJitCodeGenerator::add_parameter(const StringName &p_name, bool 
 uint32_t GDScriptJitCodeGenerator::add_local(const StringName &p_name, const GDScriptDataType &p_type) {
 	int index = locals.size();
 
-	locals.push_back(ValueReference(p_type.has_type ? p_type.builtin_type : Variant::VARIANT_MAX));
+	locals.push_back(ValueRef(Address::LOCAL_VARIABLE, p_type));
 	add_stack_identifier(p_name, index);
 
 	return index;
@@ -189,7 +182,16 @@ uint32_t GDScriptJitCodeGenerator::add_local_constant(const StringName &p_name, 
 }
 
 uint32_t GDScriptJitCodeGenerator::add_or_get_constant(const Variant &p_constant) {
-	return get_constant_pos(p_constant);
+	if (constant_map.has(p_constant)) {
+		return constant_map[p_constant];
+	}
+
+	int idx = constants.size();
+	constants.push_back(ValueRef(p_constant));
+	constant_values.insert(&constants[idx], p_constant);
+	constant_map[p_constant] = idx;
+
+	return idx;
 }
 
 uint32_t GDScriptJitCodeGenerator::add_or_get_name(const StringName &p_name) {
@@ -197,46 +199,46 @@ uint32_t GDScriptJitCodeGenerator::add_or_get_name(const StringName &p_name) {
 }
 
 uint32_t GDScriptJitCodeGenerator::add_temporary(const GDScriptDataType &p_type) {
-	const Variant::Type temp_type = p_type.has_type ? p_type.builtin_type : Variant::VARIANT_MAX;
+	const Variant::Type temp_type = p_type.has_type ? p_type.builtin_type : Variant::NIL;
 	int index = -1;
 
 	if (temporaries_pool.is_empty()) {
 		index = locals.size();
-		locals.push_back(ValueReference(temp_type));
+		locals.push_back(ValueRef(Address::TEMPORARY, p_type));
 	} else {
 		int nil_i = -1;
-		int primitive_i = -1;
+		int native_i = -1;
 
 		for (int i = 0; i < temporaries_pool.size(); ++i) {
 			int temp_idx = temporaries_pool[i];
-			const ValueReference& candidate = locals[temp_idx];
+			const ValueRef& candidate = locals[temp_idx];
 
-			if (candidate.type == temp_type) {
+			if (candidate.type->variant_type == temp_type) {
 				index = temp_idx;
 				temporaries_pool.remove_at(i);
 				break;
-			} else if (candidate.type == Variant::NIL) {
+			} else if (candidate.type->variant_type == Variant::NIL) {
 				nil_i = i;
-			} else if (is_primitive_type(candidate.type)) {
-				primitive_i = i;
+			} else if (candidate.type->is_native()) {
+				native_i = i;
 			}
 		}
 
 		if (index >= 0) {
-			locals.write[index].drop_cache();
+			locals.write[index].drop_cached();
 		}
 		// In case if there is no suitable candidate of the same type.
 		else if (nil_i >= 0) {
 			index = temporaries_pool[nil_i];
 			temporaries_pool.remove_at(nil_i);
-			locals.write[index].reuse(temp_type);
-		} else if (primitive_i >= 0) {
-			index = temporaries_pool[primitive_i];
-			temporaries_pool.remove_at(primitive_i);
-			locals.write[index].reuse(temp_type);
+			locals.write[index].update_type(temp_type);
+		} else if (native_i >= 0) {
+			index = temporaries_pool[native_i];
+			temporaries_pool.remove_at(native_i);
+			locals.write[index].update_type(temp_type);
 		} else {
 			index = locals.size();
-			locals.push_back(ValueReference(temp_type));
+			locals.push_back(ValueRef(Address::TEMPORARY, p_type));
 		}
 	}
 
@@ -248,8 +250,8 @@ void GDScriptJitCodeGenerator::pop_temporary() {
 	ERR_FAIL_COND(temporaries.is_empty());
 	int value_idx = temporaries[temporaries.size() - 1];
 
-	ValueReference& value = locals.write[value_idx];
-	if (value.has_type()) {
+	ValueRef& value = locals.write[value_idx];
+	if (!value.type->is_builtin() && value.type->is_native()) {
 		// TODO: Free temporaties that can contains object.
 	}
 
@@ -315,16 +317,8 @@ GDScriptFunction *GDScriptJitCodeGenerator::write_end() {
 
 	function->_jit_function = jit_module.getPointer<ProcFunction>(proc_index);
 	function->_stack_size = max_stack_size;
-
-	// Fill constants.
-	function->constants.resize(constants_top);
-	for (auto& constant : constants) {
-		if (!constant.is_allocated()) continue;
-
-		function->constants.write[constant.index] = *constant.constant;
-	}
 	function->_constants_ptr = function->constants.ptrw();
-	function->_constant_count = constants_top;
+	function->_constant_count = function->constants.size();
 
 	return function;
 }
@@ -339,105 +333,64 @@ void GDScriptJitCodeGenerator::set_initial_line(int p_line) {
 	function->_initial_line = p_line;
 }
 
-#define HAS_BUILTIN_TYPE(m_var) \
-	(m_var.type.has_type && m_var.type.kind == GDScriptDataType::BUILTIN)
-
-#define IS_BUILTIN_TYPE(m_var, m_type) \
-	(m_var.type.has_type && m_var.type.kind == GDScriptDataType::BUILTIN && m_var.type.builtin_type == m_type && m_type != Variant::NIL)
-
 void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Variant::Type p_new_type) {
 	// 1. TODO: Destruct previouse value if needed;
 	// 2. TODO: Construct new value if needed;
 	// 3. Change `type` field.
 
-	ValueReference& target = get_value_ref(p_target);
-	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+	ValueRef& target = get_value_ref(p_target);
+	print_line("type adjust:", Variant::get_type_name(target.type->variant_type), "->", Variant::get_type_name(p_new_type));
 
-	print_line("type adjust:", Variant::get_type_name(target.type), "->", Variant::get_type_name(p_new_type));
+	target.update_type(p_new_type);
 
-	if (target.has_type()) {
-		// Change `type` field.
-		proc.si32(proc.lci(p_new_type), jit_target_ptr, 0);
-	} else {
+	if (target.type->is_dynamic()) {
+		// TODO: Destruct
+		target.state = ValueRef::UNCHANGED;
 		emit_function_call(
 			VariantInternal::initialize,
-			jit_target_ptr,
+			emit_ptr_to_object(target),
 			proc.lci(p_new_type)
 		);
+		return;
 	}
-
-	target.evaluate(p_new_type);
 }
 
 void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand) {
-	ValueReference& operand = get_value_ref(p_left_operand);
+	ValueRef& operand = get_value_ref(p_left_operand);
+	ValueRef& target = get_value_ref(p_target);
 
-	print_line("unary operator:", Variant::get_operator_name(p_operator), Variant::get_type_name(operand.type));
+	print_line("unary operator:", Variant::get_operator_name(p_operator), Variant::get_type_name(operand.type->variant_type));
+	GDScriptJit::UnaryOperatorCodeGenFunc op_codegen = GDScriptJit::get_unary_operator(p_operator, operand.type->variant_type);
 
-	if (is_primitive_type(operand.type)) {
-		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type, Variant::NIL);
-		bjit::Value jit_value = emit_data_load(operand, p_left_operand);
+	if (op_codegen) {
+		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type->variant_type, Variant::NIL);
 
-		print_line("\tprimitive evaluation - ret_type:", Variant::get_type_name(ret_type));
+		print_line("\tresult type:", Variant::get_type_name(ret_type));
+		bjit::Value jit_value = operand.type->is_native() ? emit_get_native(operand) : emit_ptr_to_data(operand);
+		bjit::Value jit_result = op_codegen(proc, jit_value);
 
-		switch (p_operator) {
-			case Variant::OP_BIT_NEGATE:
-				jit_value = proc.inot(jit_value);
-				break;
-			case Variant::OP_NEGATE:
-				if (operand.type == Variant::FLOAT)
-					jit_value = proc.fneg(jit_value);
-				else
-					jit_value = proc.ineg(jit_value);
-				break;
-			case Variant::OP_POSITIVE:
-				// Do nothing here?
-				break;
-			case Variant::OP_NOT:
-				// Cast to boolean?
-				if (operand.type == Variant::FLOAT)
-					jit_value = proc.feq(jit_value, proc.lcf(0));
-				else
-					jit_value = proc.ieq(jit_value, proc.lci(0));
-				break;
-			default:
-				break;
+		if (operand.type->is_native()) {
+			emit_set_native(target, ret_type, jit_result);
+		} else {
+			// TODO: Do something
+			target.update_type(ret_type);
 		}
-
-		emit_data_store(p_target, ret_type, jit_value);
 		return;
 	}
 
-	bjit::Value jit_operand_ptr = emit_ptr_access(p_left_operand);
-	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+	print_line("\tdynamic evaluation");
+	bjit::Value jit_operand_ptr = emit_ptr_to_object(operand);
+	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
 
-	if (operand.has_type()) {
-		Variant::ValidatedOperatorEvaluator op_func = Variant::get_validated_operator_evaluator(p_operator, operand.type, Variant::NIL);
-		if (op_func) {
-			print_line("\tvalidated operator");
-			emit_function_call(
-				op_func,
-				jit_operand_ptr,
-				proc.lci(0),
-				jit_target_ptr
-			);
-			return;
-		}
-
-		Variant::PTROperatorEvaluator ptr_op_func = Variant::get_ptr_operator_evaluator(p_operator, operand.type, Variant::NIL);
-		if (ptr_op_func) {
-			print_line("\tpointer operator");
-			emit_function_call(
-				op_func,
-				jit_operand_ptr,
-				proc.lci(0),
-				jit_target_ptr
-			);
-			return;
-		}
+	if (operand.type->variant_type != Variant::NIL) {
+		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type->variant_type, Variant::NIL);
+		print_line("\tresult type:", Variant::get_type_name(ret_type));
+		target.update_type(ret_type);
+	} else {
+		print_line("\tresult type: unknown (nil)");
+		target.update_type(Variant::NIL);
 	}
 
-	print_line("\tdynamic evaluation");
 	emit_function_call(
 		_variant_evaluate_wrapper,
 		proc.lci((int64_t)p_operator),
@@ -448,78 +401,50 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 }
 
 void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand, const Address &p_right_operand) {
-	ValueReference& lhs = get_value_ref(p_left_operand);
-	ValueReference& rhs = get_value_ref(p_right_operand);
+	ValueRef& target = get_value_ref(p_target);
+	ValueRef& lhs = get_value_ref(p_left_operand);
+	ValueRef& rhs = get_value_ref(p_right_operand);
 
-	print_line("binary operator:", Variant::get_type_name(lhs.type), Variant::get_operator_name(p_operator), Variant::get_type_name(rhs.type));
+	print_line(
+		"binary operator:",
+		Variant::get_type_name(lhs.type->variant_type),
+		Variant::get_operator_name(p_operator),
+		Variant::get_type_name(rhs.type->variant_type)
+	);
 
-	if (is_primitive_type(lhs.type) && is_primitive_type(rhs.type)) {
-		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type, rhs.type);
+	const GDScriptJit::BinaryOperatorCodeGenFunc op_codegen =
+		GDScriptJit::get_binary_operator(p_operator, lhs.type->variant_type, rhs.type->variant_type);
 
-		print_line("\tprimitive - result type:", Variant::get_type_name(ret_type));
-		bjit::Value jit_lhs = emit_data_load(lhs, p_left_operand);
-		bjit::Value jit_rhs = emit_data_load(rhs, p_right_operand);
-		bjit::Value jit_result;
+	if (op_codegen) {
+		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type->variant_type, rhs.type->variant_type);
 
-		const bool is_float = ret_type == Variant::FLOAT;
+		print_line("\tnative - result type:", Variant::get_type_name(ret_type));
+		bjit::Value jit_lhs = lhs.type->is_native() ? emit_get_native(lhs) : emit_ptr_to_data(lhs);
+		bjit::Value jit_rhs = rhs.type->is_native() ? emit_get_native(rhs) : emit_ptr_to_data(rhs);
+		bjit::Value jit_result = op_codegen(proc, jit_lhs, jit_rhs);
 
-		// Cast to float.
-		if (is_float) {
-			if (lhs.type != Variant::FLOAT) {
-				jit_lhs = proc.ci2d(jit_lhs);
-			} else if (rhs.type != Variant::FLOAT) {
-				jit_rhs = proc.ci2d(jit_rhs);
-			}
-
-			switch (p_operator) {
-				case Variant::OP_ADD:
-					jit_result = proc.dadd(jit_lhs, jit_rhs); break;
-				case Variant::OP_SUBTRACT:
-					jit_result = proc.dsub(jit_lhs, jit_rhs); break;
-				case Variant::OP_MULTIPLY:
-					jit_result = proc.dmul(jit_lhs, jit_rhs); break;
-				case Variant::OP_DIVIDE:
-					jit_result = proc.ddiv(jit_lhs, jit_rhs); break;	
-				default:
-					break;
-			}
+		if (target.type->is_native()) {
+			emit_set_native(target, ret_type, jit_result);
 		} else {
-			if (lhs.type == Variant::FLOAT) {
-				jit_lhs = proc.cd2i(jit_lhs);
-			} else if (rhs.type == Variant::FLOAT) {
-				jit_rhs = proc.cd2i(jit_rhs);
-			}
-
-			switch (p_operator) {
-				case Variant::OP_ADD:
-					jit_result = proc.iadd(jit_lhs, jit_rhs); break;
-				case Variant::OP_SUBTRACT:
-					jit_result = proc.isub(jit_lhs, jit_rhs); break;
-				case Variant::OP_MULTIPLY:
-					jit_result = proc.imul(jit_lhs, jit_rhs); break;
-				case Variant::OP_DIVIDE:
-					jit_result = proc.idiv(jit_lhs, jit_rhs); break;	
-				default:
-					break;
-			}
+			// TODO: Do something
+			target.update_type(ret_type);
 		}
-
-		emit_data_store(p_target, ret_type, jit_result);
 		return;
 	}
 
 	{
 		print_line("\tdynamic evaluation");
-		bjit::Value jit_lhs_ptr = emit_ptr_access(p_left_operand);
-		bjit::Value jit_rhs_ptr = emit_ptr_access(p_right_operand);
-		bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+		bjit::Value jit_lhs_ptr = emit_ptr_to_object(lhs);
+		bjit::Value jit_rhs_ptr = emit_ptr_to_object(rhs);
+		bjit::Value jit_target_ptr = emit_ptr_to_object(target);
 
-		if (lhs.type != Variant::VARIANT_MAX && rhs.type != Variant::VARIANT_MAX) {
-			Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type, rhs.type);
-			ValueReference& target = get_value_ref(p_target);
-
-			print_line("\tassumed result type:", Variant::get_type_name(ret_type));
-			target.evaluate(ret_type);
+		if (lhs.type->variant_type != Variant::NIL && rhs.type->variant_type != Variant::NIL) {
+			Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type->variant_type, rhs.type->variant_type);
+			print_line("\tresult type:", Variant::get_type_name(ret_type));
+			target.update_type(ret_type);
+		} else {
+			print_line("\tresult type: unknown (nil)");
+			target.update_type(Variant::NIL);
 		}
 
 		emit_function_call(
@@ -575,96 +500,38 @@ void GDScriptJitCodeGenerator::write_get(const Address &p_target, const Address 
 }
 
 void GDScriptJitCodeGenerator::write_set_named(const Address &p_target, const StringName &p_name, const Address &p_source) {
-	bjit::Value jit_source_ptr = emit_ptr_access(p_source);
-	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+	bjit::Value jit_source_ptr = emit_ptr_to_object(get_value_ref(p_source));
+	bjit::Value jit_target_ptr = emit_ptr_to_object(get_value_ref(p_target));
 
 	emit_function_call(
 		_variant_set_named_wrapper,
 		jit_target_ptr,
-		proc.lcu((uintptr_t)get_name_ptr(p_name)),
+		emit_name_ptr(p_name),
 		jit_source_ptr
 	);
 }
 
 void GDScriptJitCodeGenerator::write_get_named(const Address &p_target, const StringName &p_name, const Address &p_source) {
-	ValueReference& source = get_value_ref(p_source);
-	ValueReference& target = get_value_ref(p_target);
+	ValueRef& source = get_value_ref(p_source);
+	ValueRef& target = get_value_ref(p_target);
 
-	bjit::Value jit_source_ptr = emit_ptr_access(p_source);
-	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
+	bjit::Value jit_source_ptr = emit_ptr_to_object(source);
+	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
 
-	target.evaluate(Variant::get_member_type(source.type, p_name));
+	target.update_type(Variant::get_member_type(source.type->variant_type, p_name));
 
 	emit_function_call(
 		_variant_get_named_wrapper,
 		jit_source_ptr,
-		proc.lcu((uintptr_t)get_name_ptr(p_name)),
+		emit_name_ptr(p_name),
 		jit_target_ptr
 	);
 }
 
 void GDScriptJitCodeGenerator::write_set_member(const Address &p_value, const StringName &p_name) {
-	ValueReference& value = get_value_ref(p_value);
-
-	const MemberInfo& member_info = get_member_info(p_name);
-	const unsigned member_offset = sizeof(Variant) * member_info.index;
-
-	print_line("set member:", p_name, Variant::get_type_name(member_info.type));
-
-	if (is_primitive_type(member_info.type) && member_info.type == value.type) {
-		unsigned member_data_offset = member_offset + _variant_data_field_offset;
-		bjit::Value jit_value = emit_data_load(value, p_value);
-
-		switch (value.type) {
-			case Variant::BOOL:
-				proc.si8(jit_value, proc.env[ENV_MEMBERS], member_data_offset);
-				break;
-			case Variant::FLOAT:
-				proc.sf64(jit_value, proc.env[ENV_MEMBERS], member_data_offset);
-				break;
-			default:
-				proc.si64(jit_value, proc.env[ENV_MEMBERS], member_data_offset);
-				break;
-		}
-		return;
-	}
-
-	bjit::Value jit_value_ptr = emit_ptr_access(p_value);
-	bjit::Value jit_member_ptr = proc.iadd(proc.env[ENV_MEMBERS], proc.lcu(member_offset));
-
-	emit_function_call(
-		_variant_assign_wrapper,
-		jit_member_ptr,
-		jit_value_ptr
-	);
 }
 
 void GDScriptJitCodeGenerator::write_get_member(const Address &p_target, const StringName &p_name) {
-	const MemberInfo& member_info = get_member_info(p_name);
-	const unsigned member_offset = sizeof(Variant) * member_info.index;
-
-	print_line("get member:", p_name, Variant::get_type_name(member_info.type), ":", member_info.index, ":", member_info.class_name);
-
-	ValueReference& target = get_value_ref(p_target);
-
-	if (is_primitive_type(member_info.type) && member_info.index >= 0) {
-		unsigned member_data_offset = member_offset + _variant_data_field_offset;
-		target._load_primitive_from_mem(proc, proc.env[ENV_MEMBERS], member_data_offset);
-
-		target.set_changed((target.type != member_info.type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED);
-		target.type = member_info.type;
-		return;
-	}
-
-	bjit::Value jit_target_ptr = emit_ptr_access(p_target);
-	bjit::Value jit_member_ptr = proc.iadd(proc.env[ENV_MEMBERS], proc.lcu(member_offset));
-
-	target.evaluate(member_info.type);
-	emit_function_call(
-		_variant_assign_wrapper,
-		jit_target_ptr,
-		jit_member_ptr
-	);
 }
 
 void GDScriptJitCodeGenerator::write_set_static_variable(const Address &p_value, const Address &p_class, int p_index) {
@@ -677,38 +544,26 @@ void GDScriptJitCodeGenerator::write_assign_with_conversion(const Address &p_tar
 }
 
 void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Address &p_source) {
-	ValueReference& source = get_value_ref(p_source);
-	ValueReference& target = get_value_ref(p_target);
+	ValueRef& source = get_value_ref(p_source);
+	ValueRef& target = get_value_ref(p_target);
 
-	print_line("assign", Variant::get_type_name(target.type), "->", Variant::get_type_name(source.type));
-
-	if (is_primitive_type(source.type)) {
-		print_line("\tprimitive!");
-
-		ValueReference& target = get_value_ref(p_target);
-		bjit::Value jit_value = emit_data_load(source, p_source);
-
-		// Cast to/from double if needed.
-		if (target.has_type() && target.type != source.type) {
-			if (target.type == Variant::FLOAT) {
-				jit_value = proc.ci2d(jit_value);
-			} else if (source.type == Variant::FLOAT) {
-				jit_value = proc.cd2i(jit_value);
-			}
-		}
-
-		emit_data_store(p_target, source.type, jit_value);
+	print_line("assign", Variant::get_type_name(target.type->variant_type), "->", Variant::get_type_name(source.type->variant_type));
+	if (source.type->is_native() && target.mode != ValueRef::EXTERNAL) {
+		print_line("\tnative");
+		bjit::Value jit_value = emit_get_native(source);
+		emit_set_native(target, source.type->variant_type, jit_value);
 		return;
 	}
 
 	print_line("\twrapper call");
 	emit_function_call(
 		_variant_assign_wrapper,
-		emit_ptr_access(p_target),
-		emit_ptr_access(p_source)
+		emit_ptr_to_object(target),
+		emit_ptr_to_object(source)
 	);
 	
-	target.evaluate(source.type);
+	target.drop_cached();
+	target.type = source.type;
 }
 
 void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
@@ -742,28 +597,38 @@ void GDScriptJitCodeGenerator::write_call_async(const Address &p_target, const A
 }
 
 void GDScriptJitCodeGenerator::write_call_gdscript_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) {
-	print_line("gdscript utility call");
 }
 
 void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const StringName &p_function, const Vector<Address> &p_arguments) {
 	print_line("utility call:", p_function);
 
-	const StringName* name_ptr = get_name_ptr(p_function);
 	bool is_return = Variant::has_utility_function_return_value(p_function);
-
 	print_line("\treturns:", is_return, "target:", p_target.mode);
 
-	bjit::Value jit_target_ptr = is_return ? emit_ptr_access(p_target) : proc.lci(0);
+	ValueRef* target = is_return ? &get_value_ref(p_target) : nullptr;
+
+	bjit::Value jit_target_ptr = is_return ? emit_ptr_to_object(*target) : proc.lci(0);
 	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
 
 	if (is_return) {
-		ValueReference& target = get_value_ref(p_target);
-		target.evaluate(Variant::get_utility_function_return_type(p_function));
+		target->update_type(Variant::get_utility_function_return_type(p_function));
+	}
+
+	Variant::ValidatedUtilityFunction utility_func = Variant::get_validated_utility_function(p_function);
+	if (utility_func) {
+		print_line("\tvalidated");
+		emit_function_call(
+			utility_func,
+			jit_target_ptr,
+			jit_args,
+			proc.lcu(p_arguments.size())
+		);
+		return;
 	}
 
 	emit_function_call(
 		_variant_call_utility_function_wrapper,
-		proc.lcu((uintptr_t)name_ptr),
+		emit_name_ptr(p_function),
 		jit_target_ptr,
 		jit_args,
 		proc.lcu(p_arguments.size())
@@ -786,42 +651,9 @@ void GDScriptJitCodeGenerator::write_call_native_static_validated(const GDScript
 }
 
 void GDScriptJitCodeGenerator::write_call_method_bind(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
-	bjit::Value jit_variant_ptr = emit_ptr_access(p_base);
-	bjit::Value jit_object_ptr = proc.li64(jit_variant_ptr, _variant_data_field_offset + _object_data_ptr_field_offset);
-	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
-
-	if (p_method->has_return()) {
-		ValueReference& target = get_value_ref(p_target);
-		target.evaluate(p_method->get_return_info().type);
-	}
-
-	emit_function_call(
-		_method_bind_call_wrapper,
-		proc.lcu((uintptr_t)p_method),
-		jit_object_ptr,
-		jit_args,
-		proc.lcu(p_arguments.size())
-	);
 }
 
 void GDScriptJitCodeGenerator::write_call_method_bind_validated(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
-	bjit::Value jit_variant_ptr = emit_ptr_access(p_base);
-	bjit::Value jit_object_ptr = proc.li64(jit_variant_ptr, _variant_data_field_offset + _object_data_ptr_field_offset);
-	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
-	bjit::Value jit_target_ptr = p_method->has_return() ? emit_ptr_access(p_target) : proc.lci(0);
-
-	if (p_method->has_return()) {
-		ValueReference& target = get_value_ref(p_target);
-		target.evaluate(p_method->get_return_info().type);
-	}
-
-	emit_function_call(
-		_method_bind_validated_call_wrapper,
-		proc.lcu((uintptr_t)p_method),
-		jit_object_ptr,
-		jit_args,
-		jit_target_ptr
-	);
 }
 
 void GDScriptJitCodeGenerator::write_call_self(const Address &p_target, const StringName &p_function_name, const Vector<Address> &p_arguments) {

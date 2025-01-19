@@ -33,6 +33,7 @@
 
 #include "gdscript_codegen.h"
 #include "gdscript_function.h"
+#include "gdscript_jit.h"
 #include "gdscript_utility_functions.h"
 
 #include <bjit.h>
@@ -50,7 +51,93 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	static constexpr unsigned _variant_data_field_offset = sizeof(uint64_t);
 	static constexpr unsigned _object_data_ptr_field_offset = sizeof(ObjectID);
 
-	static bool is_primitive_type(const Variant::Type variant_type);
+	struct ValueRef {
+		enum LazyState : uint8_t {
+			UNCHANGED = 0,
+			VALUE_CHANGED,
+			TYPE_CHANGED,
+		};
+		enum AddressMode : uint8_t {
+			LOCAL = 0,
+			TEMPORARY,
+			CONSTANT,
+			ARGUMENT,
+			EXTERNAL
+		};
+
+		bjit::Value ptr{0};
+		bjit::Value cached{0};
+
+		LazyState state = UNCHANGED;
+		AddressMode mode = LOCAL;
+
+		const GDScriptJit::TypeInfo* type = nullptr;
+
+		int offset = -1;
+
+		ValueRef() = default;
+		ValueRef(const Address::AddressMode p_mode, const GDScriptDataType& p_type) {
+			switch (p_mode) {
+				case Address::CONSTANT:
+					mode = CONSTANT;
+					break;
+				case Address::LOCAL_VARIABLE:
+					state = TYPE_CHANGED;
+					mode = LOCAL;
+					break;
+				case Address::FUNCTION_PARAMETER:
+					mode = ARGUMENT;
+					break;
+				case Address::TEMPORARY:
+					state = TYPE_CHANGED;
+					mode = TEMPORARY;
+					break;
+				case Address::NIL:
+					mode = EXTERNAL;
+					break;
+				default:
+					mode = EXTERNAL;
+					ERR_FAIL_MSG("Invalid addressing mode");
+					print_line("Addressing mode:", (unsigned)p_mode);
+					break;
+			}
+
+			type = p_type.has_type ?
+				GDScriptJit::TypeInfo::from_variant(p_type.builtin_type) :
+				GDScriptJit::TypeInfo::from<std::nullptr_t>();
+		}
+
+		ValueRef(const Variant &p_constant) {
+			mode = CONSTANT;
+			type = GDScriptJit::TypeInfo::from_variant(p_constant.get_type());
+		}
+
+		_FORCE_INLINE_ bool is_allocated() const {
+			return (mode > CONSTANT) || (offset >= 0);
+		}
+
+		_FORCE_INLINE_ bool is_cached() const {
+			return cached.index != 0;
+		}
+
+		_FORCE_INLINE_ void drop_cached() {
+			cached.index = 0;
+		}
+
+		_FORCE_INLINE_ void update_type(const Variant::Type p_type) {
+			if (p_type == type->variant_type) return;
+
+			type = GDScriptJit::TypeInfo::from_variant(p_type);
+			state = TYPE_CHANGED;
+		}
+
+		_FORCE_INLINE_ void update_value(const bjit::Value p_value) {
+			cached = p_value;
+			if (state != TYPE_CHANGED) {
+				state = VALUE_CHANGED;
+			}
+		}
+	};
 
 	struct MemberInfo {
 		int index = -1;
@@ -59,131 +146,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 		_FORCE_INLINE_ bool is_valid() {
 			return index >= 0;
-		}
-	};
-
-	struct ValueReference {
-		enum LazyState : uint8_t {
-			UNCHANGED = 0,
-			VALUE_CHANGED,
-			TYPE_CHANGED,
-		};
-
-		bjit::Value ptr{0};
-		bjit::Value cached{0};
-
-		Variant::Type type = Variant::VARIANT_MAX;
-		int index = -1;
-
-		union {
-			// For constants
-			const Variant* constant;
-
-			// For locals
-			LazyState is_changed;
-		};
-
-		ValueReference() = default;
-		ValueReference(const Variant::Type p_type, bool is_preloaded = false) :
-				type(p_type), is_changed(is_preloaded ? UNCHANGED : TYPE_CHANGED) {}
-		ValueReference(const Variant& p_constant) :
-				type(p_constant.get_type()), constant(&p_constant) {}
-
-		_FORCE_INLINE_ bool is_cached() const {
-			return cached.index != 0;
-		}
-
-		_FORCE_INLINE_ bool is_ptr_cached() const {
-			return ptr.index != 0;
-		}
-
-		_FORCE_INLINE_ bool has_type() const {
-			return type != Variant::VARIANT_MAX;
-		}
-
-		_FORCE_INLINE_ bool is_allocated() const {
-			return index >= 0;
-		}
-
-		_FORCE_INLINE_ void drop_cache() {
-			set_changed(UNCHANGED);
-			cached.index = 0;
-		}
-
-		_FORCE_INLINE_ void reuse(const Variant::Type new_type) {
-			set_changed((new_type != type) ? TYPE_CHANGED : UNCHANGED);
-
-			type = new_type;
-			cached.index = 0;
-		}
-
-		_FORCE_INLINE_ void evaluate(const Variant::Type new_type) {
-			is_changed = UNCHANGED;
-			type = new_type;
-			cached.index = 0;
-		}
-
-		_FORCE_INLINE_ void set_changed(const LazyState state) {
-			is_changed = (is_changed == TYPE_CHANGED) ? TYPE_CHANGED : state;
-		}
-
-		// The value is assumed to be constant of primitive type.
-		bjit::Value _emit_load_constant(bjit::Proc& proc) {
-			DEV_ASSERT(is_primitive_type(type));
-			const Variant* variant = constant;
-
-			switch(variant->get_type()) {
-				case Variant::BOOL:
-					cached = proc.lcu(variant->operator bool());
-					break;
-				case Variant::INT:
-					cached = proc.lci(variant->operator int64_t());
-					break;
-				case Variant::FLOAT:
-					cached = proc.lcd(variant->operator double());
-					break;
-				default:
-					cached = proc.lci(0);
-					break;
-			}
-
-			return cached;
-		}
-
-		void _load_primitive_from_mem(bjit::Proc& proc, bjit::Value jit_ptr, unsigned offset) {
-			switch(type) {
-				case Variant::BOOL:
-					cached = proc.li8(jit_ptr, offset);
-					break;
-				case Variant::FLOAT:
-					cached = proc.lf64(jit_ptr, offset);
-					break;
-				default:
-					cached = proc.li64(jit_ptr,  offset);
-					break;
-			}
-		}
-
-		// The value is assumed to be argument of primitive type.
-		bjit::Value _emit_load_argument(bjit::Proc& proc, int index) {
-			DEV_ASSERT(is_primitive_type(type));
-			if (!is_ptr_cached()) {
-				ptr = proc.li64(proc.env[ENV_FUNC_ARGS], index * sizeof(Variant*));
-			}
-
-			_load_primitive_from_mem(proc, ptr, _variant_data_field_offset);
-			return cached;
-		}
-
-		// The value is assumed to be local of primitive type.
-		bjit::Value _emit_load_local(bjit::Proc& proc) {
-			DEV_ASSERT(is_primitive_type(type));
-			const unsigned data_offset = (index * sizeof(Variant)) + _variant_data_field_offset;
-
-			_load_primitive_from_mem(proc, jit_sp, data_offset);
-
-			is_changed = UNCHANGED;
-			return cached;
 		}
 	};
 
@@ -199,36 +161,23 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	List<int> stack_identifiers_counts;
 	RBMap<StringName, int> local_constants;
 
-	Vector<ValueReference> locals;
+	Vector<ValueRef> locals;
 	HashSet<int> dirty_locals;
 
 	Vector<int> temporaries;
 	Vector<int> temporaries_pool;
 
-	Vector<ValueReference> constants;
-	Vector<ValueReference> arguments;
+	Vector<ValueRef> constants;
+	Vector<ValueRef> arguments;
 
+	RBMap<const ValueRef *, Variant> constant_values;
 	HashMap<Variant, int, VariantHasher, VariantComparator> constant_map;
 	RBMap<StringName, int> name_map;
-	RBMap<Variant::ValidatedOperatorEvaluator, int> operator_func_map;
-	RBMap<Variant::ValidatedSetter, int> setters_map;
-	RBMap<Variant::ValidatedGetter, int> getters_map;
-	RBMap<Variant::ValidatedKeyedSetter, int> keyed_setters_map;
-	RBMap<Variant::ValidatedKeyedGetter, int> keyed_getters_map;
-	RBMap<Variant::ValidatedIndexedSetter, int> indexed_setters_map;
-	RBMap<Variant::ValidatedIndexedGetter, int> indexed_getters_map;
-	RBMap<Variant::ValidatedBuiltInMethod, int> builtin_method_map;
-	RBMap<Variant::ValidatedConstructor, int> constructors_map;
-	RBMap<Variant::ValidatedUtilityFunction, int> utilities_map;
-	RBMap<GDScriptUtilityFunctions::FunctionPtr, int> gds_utilities_map;
-	RBMap<MethodBind *, int> method_bind_map;
-	RBMap<GDScriptFunction *, int> lambdas_map;
 
 	int max_locals = 0;
 
 	int stack_top = 0;
 	int max_stack_size = 0;
-	int constants_top = 0;
 
 	List<int> stack_free_list;
 
@@ -245,10 +194,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		stack_free_list.pop_back();
 
 		return idx;
-	}
-
-	int constant_alloc_idx() {
-		return constants_top++;
 	}
 
 	void stack_free_idx(int idx) {
@@ -287,7 +232,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		return ret;
 	}
 
-	ValueReference& get_value_ref(const Address& p_address) {
+	ValueRef& get_value_ref(const Address& p_address) {
 		switch (p_address.mode) {
 			case Address::FUNCTION_PARAMETER:
 				return arguments.write[p_address.address];
@@ -303,6 +248,173 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				ERR_PRINT("Unsupported address mode while code generating");
 				break;
 		}
+	}
+
+	void store_native(ValueRef& p_value) {
+		DEV_ASSERT(p_value.type->is_native());
+		const unsigned offset = p_value.offset + _variant_data_field_offset;
+
+		switch (p_value.type->variant_type) {
+			case Variant::BOOL:
+				GDScriptJit::store_to_memory<bool>(proc, p_value.cached, p_value.ptr, offset);
+				break;
+			case Variant::INT:
+				GDScriptJit::store_to_memory<int64_t>(proc, p_value.cached, p_value.ptr, offset);
+				break;
+			case Variant::FLOAT:
+				GDScriptJit::store_to_memory<double>(proc, p_value.cached, p_value.ptr, offset);
+				break;
+			default:
+				ERR_FAIL_MSG("Native value expected");
+				break;
+		}
+	}
+
+	bjit::Value load_native(const ValueRef& p_value) {
+		DEV_ASSERT(p_value.type->is_native());
+		const unsigned offset = p_value.offset + _variant_data_field_offset;
+
+		switch (p_value.type->variant_type) {
+			case Variant::BOOL:
+				return GDScriptJit::load_from_memory<bool>(proc, p_value.ptr, offset);
+				break;
+			case Variant::INT:
+				return GDScriptJit::load_from_memory<int64_t>(proc, p_value.ptr, offset);
+				break;
+			case Variant::FLOAT:
+				return GDScriptJit::load_from_memory<double>(proc, p_value.ptr, offset);
+				break;
+			default:
+				ERR_FAIL_V_MSG({0}, "Native value expected");
+				break;
+		}
+	}
+
+	bjit::Value load_native_constant(const ValueRef& p_value) {
+		DEV_ASSERT(p_value.type->is_native());
+		const Variant& variant = constant_values.find(&p_value)->get();
+
+		switch (p_value.type->variant_type) {
+			case Variant::BOOL:
+			case Variant::INT:
+				return proc.lci(variant.operator int64_t());
+				break;
+			case Variant::FLOAT:
+				return proc.lcd(variant.operator double());
+				break;
+			default:
+				ERR_FAIL_V_MSG({0}, "Native value expected");
+				break;
+		}
+	}
+
+	void try_alloc_variant_object(ValueRef& p_value) {
+		if (p_value.mode == ValueRef::ARGUMENT && p_value.ptr.index == 0) {
+			p_value.ptr = proc.li64(proc.env[ENV_FUNC_ARGS], p_value.offset);
+			p_value.offset = 0;
+		}
+
+		if (p_value.is_allocated()) return;
+
+		switch (p_value.mode) {
+			case ValueRef::LOCAL:
+			case ValueRef::TEMPORARY: {
+				int index = stack_alloc_idx();
+				p_value.ptr = jit_sp;
+				p_value.offset = sizeof(Variant) * index;
+			} break;
+			case ValueRef::CONSTANT: {
+				int index = function->constants.size();
+				function->constants.push_back(constant_values.find(&p_value));
+				p_value.ptr = proc.env[ENV_CONSTANTS];
+				p_value.offset = sizeof(Variant) * index;
+			} break;
+			default:
+				ERR_FAIL_MSG("Allocatable expected");
+				break;
+		}
+	}
+
+	void emit_sync_value_cache(ValueRef& p_value) {
+		DEV_ASSERT(p_value.is_allocated());
+		if (p_value.mode == ValueRef::EXTERNAL) return;
+
+		switch (p_value.state) {
+			case ValueRef::TYPE_CHANGED:
+				GDScriptJit::store_to_memory<int32_t>(
+					proc,
+					proc.lci(p_value.type->variant_type),
+					p_value.ptr,
+					p_value.offset
+				);
+			case ValueRef::VALUE_CHANGED: {
+				if (p_value.is_cached()) store_native(p_value);
+				p_value.state = ValueRef::UNCHANGED;
+			} break;
+			default:
+				break;
+		}
+	}
+
+	bjit::Value emit_get_native(ValueRef& p_value) {
+		if (!p_value.is_cached()) {
+			if (p_value.mode == ValueRef::CONSTANT) {
+				p_value.cached = load_native_constant(p_value);
+			} else {
+				if (p_value.mode == ValueRef::ARGUMENT && p_value.ptr.index == 0) {
+					p_value.ptr = proc.li64(proc.env[ENV_FUNC_ARGS], p_value.offset);
+					p_value.offset = 0;
+				}
+				p_value.cached = load_native(p_value);
+			}
+		}
+		return p_value.cached;
+	}
+
+	void emit_set_native(ValueRef& p_destination, const Variant::Type p_src_type, const bjit::Value p_jit_value) {
+		DEV_ASSERT(
+			p_destination.mode == ValueRef::TEMPORARY ||
+			p_destination.mode == ValueRef::LOCAL ||
+			p_destination.mode == ValueRef::ARGUMENT
+		);
+
+		p_destination.update_type(p_src_type);
+		p_destination.update_value(p_jit_value);
+	}
+
+	bjit::Value emit_ptr_to_object(ValueRef& p_value) {
+		try_alloc_variant_object(p_value);
+		emit_sync_value_cache(p_value);
+		return p_value.offset > 0 ? proc.iadd(p_value.ptr, proc.lcu(p_value.offset)) : p_value.ptr;
+	}
+
+	bjit::Value emit_ptr_to_data(ValueRef& p_value) {
+		try_alloc_variant_object(p_value);
+		emit_sync_value_cache(p_value);
+		return proc.iadd(p_value.ptr, proc.lcu((p_value.offset > 0 ? p_value.offset : 0) + _variant_data_field_offset));
+	}
+
+	bjit::Value emit_load_ptr_args(const Vector<Address>& p_args) {
+		if (p_args.size() == 0) return proc.lci(0);
+
+		Vector<bjit::Value> jit_ptrs;
+		jit_ptrs.resize(p_args.size());
+
+		for (int i = 0; i < p_args.size(); ++i) {
+			jit_ptrs.write[i] = emit_ptr_to_object(get_value_ref(p_args[i]));
+		}
+
+		bjit::Value jit_ptr_args = proc.iadd(jit_sp, proc.lcu(stack_top * sizeof(Variant)));
+		for (int i = 0; i < p_args.size(); ++i) {
+			proc.si64(jit_ptrs[i], jit_ptr_args, i * sizeof(uintptr_t));
+		}
+
+		int _stack_slots = ((p_args.size() + 1) * sizeof(Variant*)) / sizeof(Variant);
+		if (stack_top + _stack_slots > max_stack_size) {
+			max_stack_size = stack_top + _stack_slots;
+		}
+	
+		return jit_ptr_args;
 	}
 
 	template<typename R, typename... FuncArgs, typename... JitArgs>
@@ -322,131 +434,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
-	// The value is assumed to be of primitive type.
-	bjit::Value emit_data_load(ValueReference& p_value, const Address& p_address) {
-		DEV_ASSERT(is_primitive_type(p_value.type));
-
-		// Check cached immediate or loaded from memory value.
-		if (p_value.is_cached()) return p_value.cached;
-
-		if (p_address.mode == Address::CONSTANT) {
-			// Load immediate value.
-			print_line("load imm -> constant(", p_address.address, "):", Variant::get_type_name(p_value.type));
-			return p_value._emit_load_constant(proc);
-		} else if (p_address.mode == Address::FUNCTION_PARAMETER) {
-			print_line("load mem -> argument(", p_address.address, "):", Variant::get_type_name(p_value.type));
-			return p_value._emit_load_argument(proc, p_address.address);
-		} else if (p_value.is_allocated()) {
-			print_line("load mem -> local(", p_address.address, "):", Variant::get_type_name(p_value.type));
-			return p_value._emit_load_local(proc);
-		}
-
-		// Invalid case
-		ERR_FAIL_V_MSG(proc.lci(0), "Trying to load data from memory of non-allocated local.");
-	}
-
-	// The value is assumed to be a local of primitive type.
-	void emit_data_store(const Address& dst_addr, const Variant::Type src_type, const bjit::Value jit_value) {
-		DEV_ASSERT(dst_addr.mode == Address::TEMPORARY || dst_addr.mode == Address::LOCAL_VARIABLE);
-		DEV_ASSERT(is_primitive_type(src_type));
-
-		ValueReference& dst = locals.write[dst_addr.address];
-
-		// Lazy: storing will be emitted only if a pointer to the value is accessed.
-		dst.set_changed((dst.type != src_type) ? ValueReference::TYPE_CHANGED : ValueReference::VALUE_CHANGED);
-		print_line("lazy data store: local(", dst_addr.address, ")", Variant::get_type_name(dst.type), "->", Variant::get_type_name(src_type));
-
-		dst.type = src_type;
-		dst.cached = jit_value;
-	}
-
-	bjit::Value emit_ptr_access(const Address& address) {
-		if (address.mode == Address::CONSTANT) {
-			ValueReference& value = constants.write[address.address];
-			print_line("get pointer -> constant(", address.address, "):", Variant::get_type_name(value.type));
-
-			if (value.is_ptr_cached()) return value.ptr;
-			DEV_ASSERT(value.is_allocated() == false);
-
-			value.index = constant_alloc_idx();
-			value.ptr = proc.iadd(proc.env[ENV_CONSTANTS], proc.lcu(value.index * sizeof(Variant)));
-
-			return value.ptr;
-		} else if (address.mode == Address::FUNCTION_PARAMETER) {
-			ValueReference& value = arguments.write[address.address];
-			print_line("get pointer -> argument(", address.address, "):", Variant::get_type_name(value.type));
-
-			if (value.is_ptr_cached()) return value.ptr;
-			value.ptr = proc.li64(proc.env[ENV_FUNC_ARGS], address.address * sizeof(Variant*));
-
-			return value.ptr;
-		}
-
-		ValueReference& value = locals.write[address.address];
-		print_line("get pointer -> local(", address.address, "):", Variant::get_type_name(value.type));
-
-		if (!value.is_ptr_cached()) {
-			DEV_ASSERT(value.is_allocated() == false);
-			value.index = stack_alloc_idx();
-			value.ptr = proc.iadd(jit_sp, proc.lcu(value.index * sizeof(Variant)));
-		}
-
-		const unsigned data_offset = (value.index * sizeof(Variant)) + _variant_data_field_offset;
-
-		// Lazy storing if needed.
-		switch (value.is_changed) {
-			// Emit type field assign with falling to value assign.
-			case ValueReference::TYPE_CHANGED:
-				print_line("storing type:", Variant::get_type_name(value.type), "offset:", (value.index * sizeof(Variant)));
-				proc.si32(proc.lcu(value.type), jit_sp, (value.index * sizeof(Variant)));
-			// Emit value assign.
-			case ValueReference::VALUE_CHANGED:
-				if (value.is_cached()) {
-					print_line("storing value:", Variant::get_type_name(value.type), "(cached) offset:", data_offset);
-					switch (value.type) {
-						case Variant::BOOL:
-							proc.si8(value.cached, jit_sp, data_offset);
-							break;
-						case Variant::FLOAT:
-							proc.sf64(value.cached, jit_sp, data_offset);
-							break;
-						default:
-							proc.si64(value.cached, jit_sp, data_offset);
-							break;
-					}
-				}
-				value.is_changed = ValueReference::UNCHANGED;
-				break;
-			case ValueReference::UNCHANGED:
-				break;
-		}
-
-		return value.ptr;
-	}
-
-	bjit::Value emit_load_ptr_args(const Vector<Address>& p_args) {
-		if (p_args.size() == 0) return proc.lci(0);
-
-		Vector<bjit::Value> jit_ptrs;
-		jit_ptrs.resize(p_args.size());
-
-		for (int i = 0; i < p_args.size(); ++i) {
-			jit_ptrs.write[i] = emit_ptr_access(p_args[i]);
-		}
-
-		bjit::Value jit_ptr_args = proc.iadd(jit_sp, proc.lcu(stack_top * sizeof(Variant)));
-		for (int i = 0; i < p_args.size(); ++i) {
-			proc.si64(jit_ptrs[i], jit_ptr_args, i * sizeof(uintptr_t));
-		}
-
-		int _stack_slots = ((p_args.size() + 1) * sizeof(Variant*)) / sizeof(Variant);
-		if (stack_top + _stack_slots > max_stack_size) {
-			max_stack_size = stack_top + _stack_slots;
-		}
-	
-		return jit_ptr_args;
-	}
-
 	void add_stack_identifier(const StringName &p_id, int p_stackpos) {
 		if (locals.size() > max_locals) {
 			max_locals = locals.size();
@@ -454,35 +441,33 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		stack_identifiers[p_id] = p_stackpos;
 	}
 
-	void push_stack_identifiers() {
-		stack_identifiers_counts.push_back(locals.size());
-		stack_id_stack.push_back(stack_identifiers);
-	}
-
-	void pop_stack_identifiers() {
-		int current_locals = stack_identifiers_counts.back()->get();
-		stack_identifiers_counts.pop_back();
-		stack_identifiers = stack_id_stack.back()->get();
-		stack_id_stack.pop_back();
-		for (int i = current_locals; i < locals.size(); i++) {
-			dirty_locals.insert(i + GDScriptFunction::FIXED_ADDRESSES_MAX);
-		}
-		locals.resize(current_locals);
-	}
-
 	const StringName* get_name_ptr(const StringName& p_identifier) {
+		static Vector<StringName> names;
+
 		int pos;
 		if (!name_map.has(p_identifier)) {
-			pos = function->global_names.size();
+			pos = names.size();
 			name_map[p_identifier] = pos;
 
-			function->utilities_names.append(p_identifier);
-			function->global_names.append(function->utilities_names[function->utilities_names.size() - 1]);
+			names.append(p_identifier);
 		} else {
 			pos = name_map[p_identifier];
 		}
 
-		return &function->global_names[pos];
+		return &names[pos];
+	}
+
+	bjit::Value emit_name_ptr(const StringName& p_identifier) {
+		int pos;
+		if (!name_map.has(p_identifier)) {
+			pos = function->constants.size();
+			function->constants.append(p_identifier);
+		} else {
+			pos = name_map.find(p_identifier)->get();
+		}
+
+		int offset = (sizeof(Variant) * pos) + _variant_data_field_offset;
+		return proc.iadd(proc.env[ENV_CONSTANTS], proc.lci(offset));
 	}
 
 	int get_name_map_pos(const StringName &p_identifier) {
@@ -494,133 +479,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			ret = name_map[p_identifier];
 		}
 		return ret;
-	}
-
-	int get_constant_pos(const Variant &p_constant) {
-		if (constant_map.has(p_constant)) {
-			return constant_map[p_constant];
-		}
-		int idx = constants.size();
-		constants.push_back(ValueReference(p_constant));
-		constant_map[p_constant] = idx;
-		return idx;
-	}
-
-	int get_operation_pos(const Variant::ValidatedOperatorEvaluator p_operation) {
-		if (operator_func_map.has(p_operation)) {
-			return operator_func_map[p_operation];
-		}
-		int pos = operator_func_map.size();
-		operator_func_map[p_operation] = pos;
-		return pos;
-	}
-
-	int get_setter_pos(const Variant::ValidatedSetter p_setter) {
-		if (setters_map.has(p_setter)) {
-			return setters_map[p_setter];
-		}
-		int pos = setters_map.size();
-		setters_map[p_setter] = pos;
-		return pos;
-	}
-
-	int get_getter_pos(const Variant::ValidatedGetter p_getter) {
-		if (getters_map.has(p_getter)) {
-			return getters_map[p_getter];
-		}
-		int pos = getters_map.size();
-		getters_map[p_getter] = pos;
-		return pos;
-	}
-
-	int get_keyed_setter_pos(const Variant::ValidatedKeyedSetter p_keyed_setter) {
-		if (keyed_setters_map.has(p_keyed_setter)) {
-			return keyed_setters_map[p_keyed_setter];
-		}
-		int pos = keyed_setters_map.size();
-		keyed_setters_map[p_keyed_setter] = pos;
-		return pos;
-	}
-
-	int get_keyed_getter_pos(const Variant::ValidatedKeyedGetter p_keyed_getter) {
-		if (keyed_getters_map.has(p_keyed_getter)) {
-			return keyed_getters_map[p_keyed_getter];
-		}
-		int pos = keyed_getters_map.size();
-		keyed_getters_map[p_keyed_getter] = pos;
-		return pos;
-	}
-
-	int get_indexed_setter_pos(const Variant::ValidatedIndexedSetter p_indexed_setter) {
-		if (indexed_setters_map.has(p_indexed_setter)) {
-			return indexed_setters_map[p_indexed_setter];
-		}
-		int pos = indexed_setters_map.size();
-		indexed_setters_map[p_indexed_setter] = pos;
-		return pos;
-	}
-
-	int get_indexed_getter_pos(const Variant::ValidatedIndexedGetter p_indexed_getter) {
-		if (indexed_getters_map.has(p_indexed_getter)) {
-			return indexed_getters_map[p_indexed_getter];
-		}
-		int pos = indexed_getters_map.size();
-		indexed_getters_map[p_indexed_getter] = pos;
-		return pos;
-	}
-
-	int get_builtin_method_pos(const Variant::ValidatedBuiltInMethod p_method) {
-		if (builtin_method_map.has(p_method)) {
-			return builtin_method_map[p_method];
-		}
-		int pos = builtin_method_map.size();
-		builtin_method_map[p_method] = pos;
-		return pos;
-	}
-
-	int get_constructor_pos(const Variant::ValidatedConstructor p_constructor) {
-		if (constructors_map.has(p_constructor)) {
-			return constructors_map[p_constructor];
-		}
-		int pos = constructors_map.size();
-		constructors_map[p_constructor] = pos;
-		return pos;
-	}
-
-	int get_utility_pos(const Variant::ValidatedUtilityFunction p_utility) {
-		if (utilities_map.has(p_utility)) {
-			return utilities_map[p_utility];
-		}
-		int pos = utilities_map.size();
-		utilities_map[p_utility] = pos;
-		return pos;
-	}
-
-	int get_gds_utility_pos(const GDScriptUtilityFunctions::FunctionPtr p_gds_utility) {
-		if (gds_utilities_map.has(p_gds_utility)) {
-			return gds_utilities_map[p_gds_utility];
-		}
-		int pos = gds_utilities_map.size();
-		gds_utilities_map[p_gds_utility] = pos;
-		return pos;
-	}
-
-	int get_method_bind_pos(MethodBind *p_method) {
-		if (method_bind_map.has(p_method)) {
-			return method_bind_map[p_method];
-		}
-		int pos = method_bind_map.size();
-		method_bind_map[p_method] = pos;
-		return pos;
-	}
-
-	int get_lambda_function_pos(GDScriptFunction *p_lambda_function) {
-		if (lambdas_map.has(p_lambda_function)) {
-			return lambdas_map[p_lambda_function];
-		}
-		int pos = lambdas_map.size();
-		lambdas_map[p_lambda_function] = pos;
-		return pos;
 	}
 public:
 	virtual uint32_t add_parameter(const StringName &p_name, bool p_is_optional, const GDScriptDataType &p_type) override;

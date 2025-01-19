@@ -51,7 +51,7 @@ public:
 		HashMap<StringName, FieldInfo> fields;
 	private:
 		static HashMap<Variant::Type, const TypeInfo*> variant_map;
-		static HashMap<size_t, const Variant*> typeid_map;
+		static HashMap<size_t, const TypeInfo*> typeid_map;
 
 		static bool _static_init;
 
@@ -99,12 +99,9 @@ public:
 		static constexpr unsigned _data_alignment = 8;
 		static constexpr unsigned _data_field_offset = _data_alignment;
 		static constexpr unsigned _data_field_size = sizeof(Variant) - _data_field_offset;
-
-		Variant::Type type;
-		uint8_t alignas(_data_alignment) _data[_data_field_size];
 	};
 private:
-	friend class TypeInfo;
+	friend struct TypeInfo;
 
 	enum UnaryOperator {
 		NEGATE = 0,
@@ -117,6 +114,14 @@ private:
 	static UnaryOperatorCodeGenFunc unary_operators_table[Variant::VARIANT_MAX][UNARY_OP_MAX];
 	static BinaryOperatorCodeGenFunc binary_operators_table[Variant::VARIANT_MAX][Variant::VARIANT_MAX][Variant::OP_MAX];
 public:
+	static UnaryOperatorCodeGenFunc get_unary_operator(Variant::Operator p_operator, Variant::Type p_type) {
+		return unary_operators_table[p_type][p_operator];
+	}
+
+	static BinaryOperatorCodeGenFunc get_binary_operator(Variant::Operator p_operator, Variant::Type p_lhs_type, Variant::Type p_rhs_type) {
+		return binary_operators_table[p_lhs_type][p_rhs_type][p_operator];
+	}
+
 	template<typename To, typename From>
 	static _FORCE_INLINE_ bjit::Value cast_to(bjit::Proc& proc, const bjit::Value val) {
 	    if constexpr (std::is_same_v<To, From>) {
@@ -134,9 +139,9 @@ public:
 	        if constexpr (std::is_same_v<From, float>) return proc.cd2i(val);
 	        else if constexpr (std::is_same_v<From, float>) return proc.cf2i(val);
 	        else if constexpr (std::is_integral_v<From>) return val;
-	    }
-
-	    static_assert("Bad cast: invalid source type" && false);
+	    } else {
+	    	static_assert("Bad cast: invalid source type" && false);
+		}
 	}
 
 	template<typename T>

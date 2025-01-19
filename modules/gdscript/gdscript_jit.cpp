@@ -54,7 +54,7 @@ struct NativeBinaryOperators {
     static constexpr bool is_float = std::is_same_v<L, double>;
 
     _FORCE_INLINE_ static bjit::Value cast_r(bjit::Proc& proc, bjit::Value rhs) {
-        return cast_to<L, R>(proc, rhs);
+        return GDScriptJit::cast_to<L, R>(proc, rhs);
     }
 
     static bjit::Value add(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
@@ -74,30 +74,30 @@ struct NativeBinaryOperators {
         return is_float ? proc.ddiv(lhs, casted_rhs) : proc.idiv(lhs, casted_rhs);
     }
     static bjit::Value mod(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
-        static_assert(is_float == false);
-        return proc.imod(lhs, cast_r(proc, rhs));
+        const bjit::Value result = proc.imod(GDScriptJit::cast_to<int64_t,L>(proc, lhs), cast_r(proc, rhs));
+        return GDScriptJit::cast_to<RetT,int64_t>(proc, result);
     }
     static bjit::Value pow(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
-        proc.env.push_back(cast_to<double, L>(proc, lhs)); proc.env.push_back(cast_to<double, R>(proc, rhs));
+        proc.env.push_back(GDScriptJit::cast_to<double, L>(proc, lhs)); proc.env.push_back(GDScriptJit::cast_to<double, R>(proc, rhs));
         bjit::Value ret = proc.dcallp(proc.lcu((uintptr_t)powf64), 2);
         proc.env.resize(proc.env.size() - 2);
-        return cast_to<L, double>(proc, ret);
+        return GDScriptJit::cast_to<L, double>(proc, ret);
     }
     static bjit::Value shift_left(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
-        return cast_to<RetT,int64_t>(
+        return GDScriptJit::cast_to<RetT,int64_t>(
             proc,
             proc.ishl(
-                cast_to<int64_t,L>(proc, lhs),
-                cast_to<int64_t,R>(proc, lhs)
+                GDScriptJit::cast_to<int64_t,L>(proc, lhs),
+                GDScriptJit::cast_to<int64_t,R>(proc, lhs)
             )
         );
     }
     static bjit::Value shift_right(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
-        return cast_to<RetT,int64_t>(
+        return GDScriptJit::cast_to<RetT,int64_t>(
             proc,
             proc.ishr(
-                cast_to<int64_t,L>(proc, lhs),
-                cast_to<int64_t,R>(proc, lhs)
+                GDScriptJit::cast_to<int64_t,L>(proc, lhs),
+                GDScriptJit::cast_to<int64_t,R>(proc, lhs)
             )
         );
     }
@@ -132,10 +132,6 @@ BUILTIN_TYPE(int64_t, Variant::INT,   ());
 BUILTIN_TYPE(float,   Variant::FLOAT, ());
 BUILTIN_TYPE(double,  Variant::FLOAT, ());
 
-BUILTIN_TYPE(Variant, Variant::VARIANT_MAX, (
-    BUILTIN_FIELD(GDScriptJit::VariantLayout, type),
-    BUILTIN_FIELD(GDScriptJit::VariantLayout, _data)
-));
 BUILTIN_TYPE(Vector2, Variant::VECTOR2, (
     BUILTIN_FIELD(Vector2, x),
     BUILTIN_FIELD(Vector2, y)
@@ -173,6 +169,9 @@ BUILTIN_TYPE(Color, Variant::COLOR, (
     BUILTIN_FIELD(Color, a)
 ));
 
+HashMap<Variant::Type, const GDScriptJit::TypeInfo*> GDScriptJit::TypeInfo::variant_map = {};
+HashMap<size_t, const GDScriptJit::TypeInfo*> GDScriptJit::TypeInfo::typeid_map = {};
+
 GDScriptJit::UnaryOperatorCodeGenFunc
 GDScriptJit::unary_operators_table[Variant::VARIANT_MAX][GDScriptJit::UNARY_OP_MAX] = {};
 
@@ -203,11 +202,11 @@ void GDScriptJit::TypeInfo::register_native_operators() {
     REGISTER_NATIVE_BINARY_OPERATORS(bool,    Variant::BOOL,  bool,    Variant::BOOL);
 
     REGISTER_NATIVE_BINARY_OPERATORS(int64_t, Variant::INT,   int64_t, Variant::INT);
-    REGISTER_NATIVE_BINARY_OPERATORS(int64_t, Variant::INT,   bool,    Variant::INT);
+    REGISTER_NATIVE_BINARY_OPERATORS(int64_t, Variant::INT,   bool,    Variant::BOOL);
     REGISTER_NATIVE_BINARY_OPERATORS(int64_t, Variant::INT,   double,  Variant::FLOAT);
 
     REGISTER_NATIVE_BINARY_OPERATORS(double,  Variant::FLOAT, double,  Variant::FLOAT);
-    REGISTER_NATIVE_BINARY_OPERATORS(double,  Variant::FLOAT, bool,    Variant::FLOAT);
+    REGISTER_NATIVE_BINARY_OPERATORS(double,  Variant::FLOAT, bool,    Variant::BOOL);
     REGISTER_NATIVE_BINARY_OPERATORS(double,  Variant::FLOAT, int64_t, Variant::INT);
 }
 
@@ -232,6 +231,7 @@ bool GDScriptJit::TypeInfo::register_builtin_types() {
     register_type<Vector3i>();
     register_type<Vector4>();
     register_type<Vector4i>();
+    register_type<Color>();
 
     register_native_operators();
 
