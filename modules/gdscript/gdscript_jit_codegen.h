@@ -60,8 +60,8 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		enum AddressMode : uint8_t {
 			LOCAL = 0,
 			TEMPORARY,
-			CONSTANT,
 			ARGUMENT,
+			CONSTANT,
 			EXTERNAL
 		};
 
@@ -118,6 +118,14 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 		_FORCE_INLINE_ bool is_cached() const {
 			return cached.index != 0;
+		}
+
+		_FORCE_INLINE_ bool is_nil() const {
+			return type->variant_type == Variant::NIL;
+		}
+
+		_FORCE_INLINE_ bool can_be_cached() const {
+			return mode < CONSTANT;
 		}
 
 		_FORCE_INLINE_ void drop_cached() {
@@ -311,6 +319,67 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				ERR_FAIL_V_MSG({0}, "Native value expected");
 				break;
 		}
+	}
+
+	bjit::Value emit_cast_native(ValueRef& p_value, const Variant::Type p_target_type) {
+		const bjit::Value jit_value = emit_get_native(p_value);
+
+		// Specific cast from `float` and `int` (32-bit verisons).
+		if (p_value.type->is_same<float>()) {
+			switch (p_target_type) {
+				case Variant::BOOL:
+					return GDScriptJit::cast_to<bool,float>(proc, jit_value); break;
+				case Variant::INT:
+					return GDScriptJit::cast_to<int64_t,float>(proc, jit_value); break;
+				case Variant::FLOAT:
+					return GDScriptJit::cast_to<double,float>(proc, jit_value); break;
+				default: goto inval_type;
+			}
+		} else if (p_value.type->is_same<int>()) {
+			switch (p_target_type) {
+				case Variant::BOOL:
+					return GDScriptJit::cast_to<bool,int>(proc, jit_value); break;
+				case Variant::INT:
+					return GDScriptJit::cast_to<int64_t,int>(proc, jit_value); break;
+				case Variant::FLOAT:
+					return GDScriptJit::cast_to<double,int>(proc, jit_value); break;
+				default: goto inval_type;
+			}
+		} else {
+			if (p_value.type->variant_type == p_target_type) return jit_value;
+
+			switch (p_value.type->variant_type) {
+				case Variant::BOOL:  goto cast_bool;
+				case Variant::INT:   goto cast_int;
+				case Variant::FLOAT: goto cast_double;
+				default: goto inval_type;
+			}
+		}
+
+		cast_bool: {
+			switch (p_target_type) {
+				case Variant::INT:   return GDScriptJit::cast_to<int64_t, bool>(proc, jit_value); break;
+				case Variant::FLOAT: return GDScriptJit::cast_to<double,  bool>(proc, jit_value); break;
+				default: goto inval_type;
+			}
+		}
+		cast_int: {
+			switch (p_target_type) {
+				case Variant::BOOL:  return GDScriptJit::cast_to<bool,    int64_t>(proc, jit_value); break;
+				case Variant::FLOAT: return GDScriptJit::cast_to<double,  int64_t>(proc, jit_value); break;
+				default: goto inval_type;
+			}
+		}
+		cast_double: {
+			switch (p_target_type) {
+				case Variant::BOOL:  return GDScriptJit::cast_to<bool,    double>(proc, jit_value); break;
+				case Variant::INT:   return GDScriptJit::cast_to<int64_t, double>(proc, jit_value); break;
+				default: goto inval_type;
+			}
+		}
+
+		inval_type:
+		ERR_FAIL_V_MSG({0}, "Invalid native type");
 	}
 
 	void try_alloc_variant_object(ValueRef& p_value) {

@@ -297,7 +297,7 @@ GDScriptFunction *GDScriptJitCodeGenerator::write_end() {
 	bjit::Module& jit_module = jit_modules_map[function];
 	if (jit_module.isLoaded()) jit_module.unload();
 
-	// Setup stacks size.
+	// Setup stack size.
 	proc.getOps()[0].imm32 = max_stack_size * sizeof(Variant);
 
 	// Compile and debug.
@@ -547,11 +547,24 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 	ValueRef& source = get_value_ref(p_source);
 	ValueRef& target = get_value_ref(p_target);
 
-	print_line("assign", Variant::get_type_name(target.type->variant_type), "->", Variant::get_type_name(source.type->variant_type));
-	if (source.type->is_native() && target.mode != ValueRef::EXTERNAL) {
+	print_line("assign", Variant::get_type_name(target.type->variant_type), ":=", Variant::get_type_name(source.type->variant_type));
+	if (source.type->is_native() && (!target.type->is_dynamic() || target.is_nil())) {
 		print_line("\tnative");
-		bjit::Value jit_value = emit_get_native(source);
-		emit_set_native(target, source.type->variant_type, jit_value);
+		if (source.type != target.type) {
+			if (target.type->is_native()) {
+				// Cast.
+				target.update_value(emit_cast_native(source, target.type->variant_type));
+			} else if (target.is_nil() && target.can_be_cached()) {
+				// Assign with type change.
+				target.update_type(source.type->variant_type);
+				target.update_value(emit_get_native(source));
+			} else {
+				// FIXME: Implement
+				ERR_FAIL_MSG("Assign \'dynamic = native\' is not implemented");
+			}
+		} else {
+			target.update_value(emit_get_native(source));
+		}
 		return;
 	}
 
