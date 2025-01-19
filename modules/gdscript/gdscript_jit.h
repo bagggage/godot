@@ -136,7 +136,7 @@ public:
 	        else if constexpr (std::is_same_v<From, double>) return proc.cd2f(val);
 	    }
 	    else if constexpr (std::is_integral_v<To>) {
-	        if constexpr (std::is_same_v<From, float>) return proc.cd2i(val);
+	        if constexpr (std::is_same_v<From, double>) return proc.cd2i(val);
 	        else if constexpr (std::is_same_v<From, float>) return proc.cf2i(val);
 	        else if constexpr (std::is_integral_v<From>) return val;
 	    } else {

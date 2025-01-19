@@ -49,29 +49,95 @@ struct NativeUnaryOperators {
 };
 
 template<typename L, typename R>
-struct NativeBinaryOperators {
-    using RetT = L;
-    static constexpr bool is_float = std::is_same_v<L, double>;
+struct ReturnType {};
 
+template<>
+struct ReturnType<bool, bool> { using V = bool; };
+template<>
+struct ReturnType<bool, int32_t> { using V = int32_t; };
+template<>
+struct ReturnType<bool, int64_t> { using V = int64_t; };
+template<>
+struct ReturnType<bool, float> { using V = float; };
+template<>
+struct ReturnType<bool, double> { using V = double; };
+
+template<>
+struct ReturnType<int64_t, int64_t> { using V = int64_t; };
+template<>
+struct ReturnType<int64_t, bool> { using V = int64_t; };
+template<>
+struct ReturnType<int64_t, int32_t> { using V = int64_t; };
+template<>
+struct ReturnType<int64_t, float> { using V = float; };
+template<>
+struct ReturnType<int64_t, double> { using V = double; };
+
+template<>
+struct ReturnType<int32_t, int32_t> { using V = int32_t; };
+template<>
+struct ReturnType<int32_t, bool> { using V = int32_t; };
+template<>
+struct ReturnType<int32_t, int64_t> { using V = int64_t; };
+template<>
+struct ReturnType<int32_t, float> { using V = float; };
+template<>
+struct ReturnType<int32_t, double> { using V = double; };
+
+template<>
+struct ReturnType<float, float> { using V = float; };
+template<>
+struct ReturnType<float, bool> { using V = float; };
+template<>
+struct ReturnType<float, int32_t> { using V = float; };
+template<>
+struct ReturnType<float, int64_t> { using V = float; };
+template<>
+struct ReturnType<float, double> { using V = double; };
+
+template<>
+struct ReturnType<double, double> { using V = double; };
+template<>
+struct ReturnType<double, bool> { using V = double; };
+template<>
+struct ReturnType<double, float> { using V = double; };
+template<>
+struct ReturnType<double, int32_t> { using V = double; };
+template<>
+struct ReturnType<double, int64_t> { using V = double; };
+
+
+template<typename L, typename R>
+struct NativeBinaryOperators {
+    using RetT = ReturnType<L, R>::V;
+    static constexpr bool is_float = std::is_same_v<RetT, double> or std::is_same_v<RetT, float>;
+
+    _FORCE_INLINE_ static bjit::Value cast_l(bjit::Proc& proc, bjit::Value lhs) {
+        return GDScriptJit::cast_to<RetT, L>(proc, lhs);
+    }
     _FORCE_INLINE_ static bjit::Value cast_r(bjit::Proc& proc, bjit::Value rhs) {
-        return GDScriptJit::cast_to<L, R>(proc, rhs);
+        return GDScriptJit::cast_to<RetT, R>(proc, rhs);
     }
 
     static bjit::Value add(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
         const bjit::Value casted_rhs = cast_r(proc, rhs);
-        return is_float ? proc.dadd(lhs, casted_rhs) : proc.iadd(lhs, casted_rhs);
+        return is_float ? proc.dadd(casted_lhs, casted_rhs) : proc.iadd(casted_lhs, casted_rhs);
     }
     static bjit::Value sub(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
         const bjit::Value casted_rhs = cast_r(proc, rhs);
-        return is_float ? proc.dsub(lhs, casted_rhs) : proc.isub(lhs, casted_rhs);
+        return is_float ? proc.dsub(casted_lhs, casted_rhs) : proc.isub(casted_lhs, casted_rhs);
     }
     static bjit::Value mul(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
         const bjit::Value casted_rhs = cast_r(proc, rhs);
-        return is_float ? proc.dmul(lhs, casted_rhs) : proc.imul(lhs, casted_rhs);
+        return is_float ? proc.dmul(casted_lhs, casted_rhs) : proc.imul(casted_lhs, casted_rhs);
     }
     static bjit::Value div(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
         const bjit::Value casted_rhs = cast_r(proc, rhs);
-        return is_float ? proc.ddiv(lhs, casted_rhs) : proc.idiv(lhs, casted_rhs);
+        return is_float ? proc.ddiv(casted_lhs, casted_rhs) : proc.idiv(casted_lhs, casted_rhs);
     }
     static bjit::Value mod(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
         const bjit::Value result = proc.imod(GDScriptJit::cast_to<int64_t,L>(proc, lhs), cast_r(proc, rhs));
@@ -88,7 +154,7 @@ struct NativeBinaryOperators {
             proc,
             proc.ishl(
                 GDScriptJit::cast_to<int64_t,L>(proc, lhs),
-                GDScriptJit::cast_to<int64_t,R>(proc, lhs)
+                GDScriptJit::cast_to<int64_t,R>(proc, rhs)
             )
         );
     }
@@ -97,7 +163,7 @@ struct NativeBinaryOperators {
             proc,
             proc.ishr(
                 GDScriptJit::cast_to<int64_t,L>(proc, lhs),
-                GDScriptJit::cast_to<int64_t,R>(proc, lhs)
+                GDScriptJit::cast_to<int64_t,R>(proc, rhs)
             )
         );
     }
@@ -179,22 +245,25 @@ GDScriptJit::BinaryOperatorCodeGenFunc
 GDScriptJit::binary_operators_table[Variant::VARIANT_MAX][Variant::VARIANT_MAX][Variant::OP_MAX] = {};
 
 #define REGISTER_NATIVE_UNARY_OPERATORS(m_native,m_v_type)                                                           \
-    GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::NEGATE]     = NativeUnaryOperators<m_native>::neg;     \
-    GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::BIT_NEGATE] = NativeUnaryOperators<m_native>::bit_neg; \
-    GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::BOOL_NOT]   = NativeUnaryOperators<m_native>::bool_not;
+    GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::NEGATE]     = &NativeUnaryOperators<m_native>::neg;     \
+    GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::BIT_NEGATE] = &NativeUnaryOperators<m_native>::bit_neg; \
+    GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::BOOL_NOT]   = &NativeUnaryOperators<m_native>::bool_not;
 
 #define REGISTER_NATIVE_BINARY_OPERATORS(m_l_n,m_l_v_type,m_r_n,m_r_v_type)                                                      \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_ADD]      = NativeBinaryOperators<m_l_n,m_r_n>::add; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SUBTRACT] = NativeBinaryOperators<m_l_n,m_r_n>::sub; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_MULTIPLY] = NativeBinaryOperators<m_l_n,m_r_n>::mul; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_DIVIDE]   = NativeBinaryOperators<m_l_n,m_r_n>::div; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_MODULE]   = NativeBinaryOperators<m_l_n,m_r_n>::mod; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_POWER]    = NativeBinaryOperators<m_l_n,m_r_n>::pow; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_ADD]      = &NativeBinaryOperators<m_l_n,m_r_n>::add; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SUBTRACT] = &NativeBinaryOperators<m_l_n,m_r_n>::sub; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_MULTIPLY] = &NativeBinaryOperators<m_l_n,m_r_n>::mul; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_DIVIDE]   = &NativeBinaryOperators<m_l_n,m_r_n>::div; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_MODULE]   = &NativeBinaryOperators<m_l_n,m_r_n>::mod; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_POWER]    = &NativeBinaryOperators<m_l_n,m_r_n>::pow; \
     \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_LEFT]  = NativeBinaryOperators<m_l_n,m_r_n>::shift_left; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_RIGHT] = NativeBinaryOperators<m_l_n,m_r_n>::shift_right;
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_LEFT]  = &NativeBinaryOperators<m_l_n,m_r_n>::shift_left; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_RIGHT] = &NativeBinaryOperators<m_l_n,m_r_n>::shift_right;
 
 void GDScriptJit::TypeInfo::register_native_operators() {
+    memset(unary_operators_table, 0, sizeof(unary_operators_table));
+    memset(binary_operators_table, 0, sizeof(binary_operators_table));
+
     REGISTER_NATIVE_UNARY_OPERATORS(bool,    Variant::BOOL);
     REGISTER_NATIVE_UNARY_OPERATORS(int64_t, Variant::INT);
     REGISTER_NATIVE_UNARY_OPERATORS(double,  Variant::FLOAT);
