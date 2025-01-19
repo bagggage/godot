@@ -47,6 +47,7 @@ public:
 
 		size_t typeid_hash = 0;
 		Variant::Type variant_type = Variant::VARIANT_MAX;
+		unsigned size = 0;
 
 		HashMap<StringName, FieldInfo> fields;
 	private:
@@ -142,6 +143,43 @@ public:
 	    } else {
 	    	static_assert("Bad cast: invalid source type" && false);
 		}
+	}
+
+	static void memcpy_aligned(bjit::Proc& proc, bjit::Value dst_ptr, unsigned dst_offset, bjit::Value src_ptr, unsigned src_offset, unsigned size) {
+		// 8-bytes.
+		unsigned num = size / sizeof(int64_t);
+		unsigned mod = size % sizeof(int64_t);
+		for (int i = 0; i < num; i++) {
+			bjit::Value value = proc.li64(src_ptr, src_offset + (i * sizeof(int64_t)));
+			proc.si64(value, dst_ptr, dst_offset + (i * sizeof(int64_t)));
+		}
+		if (mod == 0) return;
+		src_offset += num * sizeof(int64_t);
+		dst_offset += num * sizeof(int64_t);
+
+		// 4-bytes.
+		if (mod >= sizeof(int32_t)) {
+			bjit::Value value = proc.li32(src_ptr, src_offset);
+			proc.si32(value, dst_ptr, dst_offset);
+			src_offset += sizeof(int32_t);
+			dst_offset += sizeof(int32_t);
+		}
+		mod = mod % sizeof(int32_t);
+		if (mod == 0) return;
+
+		// 2-bytes.
+		if (mod >= sizeof(int16_t)) {
+			bjit::Value value = proc.li16(src_ptr, src_offset);
+			proc.si16(value, dst_ptr, dst_offset);
+			src_offset += sizeof(int16_t);
+			dst_offset += sizeof(int16_t);
+		}
+		mod = mod % sizeof(int16_t);
+		if (mod == 0) return;
+
+		// 1-byte.
+		bjit::Value value = proc.li8(src_ptr, src_offset);
+		proc.si8(value, dst_ptr, dst_offset);
 	}
 
 	template<typename T>

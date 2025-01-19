@@ -157,6 +157,9 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		Variant::Type type = Variant::VARIANT_MAX;
 		StringName class_name;
 
+		MethodBind* getter = nullptr;
+		MethodBind* setter = nullptr;
+
 		_FORCE_INLINE_ bool is_valid() {
 			return index >= 0;
 		}
@@ -239,6 +242,8 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				ret.index = ClassDB::get_property_index(class_name, p_name);
 				ret.type = info.type;
 				ret.class_name = info.class_name;
+				ret.getter = ClassDB::get_method(class_name, ClassDB::get_property_getter(class_name, p_name));
+				ret.setter = ClassDB::get_method(class_name, ClassDB::get_property_setter(class_name, p_name));
 			}
 		}
 
@@ -401,7 +406,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				int index = function->constants.size();
 				const Variant& value = constant_values.find(&p_value)->get();
 				function->constants.push_back(value);
-				print_line("allocate constant:", Variant::get_type_name(value.get_type()), "(", value, ")");
 				p_value.ptr = proc.env[ENV_CONSTANTS];
 				p_value.offset = sizeof(Variant) * index;
 			} break;
@@ -411,21 +415,25 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
-	void emit_sync_value_cache(ValueRef& p_value) {
+	void emit_sync_value_cache(ValueRef& p_value, bool sync_type = true) {
 		DEV_ASSERT(p_value.is_allocated());
 		if (p_value.mode == ValueRef::EXTERNAL) return;
 
 		switch (p_value.state) {
 			case ValueRef::TYPE_CHANGED:
-				GDScriptJit::store_to_memory<int32_t>(
-					proc,
-					proc.lci(p_value.type->variant_type),
-					p_value.ptr,
-					p_value.offset
-				);
+				if (sync_type) {
+					GDScriptJit::store_to_memory<int32_t>(
+						proc,
+						proc.lci(p_value.type->variant_type),
+						p_value.ptr,
+						p_value.offset
+					);
+				}
 			case ValueRef::VALUE_CHANGED: {
 				if (p_value.is_cached()) store_native(p_value);
-				p_value.state = ValueRef::UNCHANGED;
+				p_value.state = sync_type ?
+					ValueRef::UNCHANGED :
+					(p_value.state == ValueRef::TYPE_CHANGED ? ValueRef::TYPE_CHANGED : ValueRef::UNCHANGED);
 			} break;
 			default:
 				break;
@@ -466,7 +474,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 	bjit::Value emit_ptr_to_data(ValueRef& p_value) {
 		try_alloc_variant_object(p_value);
-		emit_sync_value_cache(p_value);
+		emit_sync_value_cache(p_value, false);
 		return proc.iadd(p_value.ptr, proc.lcu((p_value.offset > 0 ? p_value.offset : 0) + _variant_data_field_offset));
 	}
 

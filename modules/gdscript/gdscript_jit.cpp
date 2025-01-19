@@ -109,7 +109,7 @@ struct ReturnType<double, int64_t> { using V = double; };
 
 template<typename L, typename R>
 struct NativeBinaryOperators {
-    using RetT = ReturnType<L, R>::V;
+    using RetT = typename ReturnType<L, R>::V;
     static constexpr bool is_float = std::is_same_v<RetT, double> or std::is_same_v<RetT, float>;
 
     _FORCE_INLINE_ static bjit::Value cast_l(bjit::Proc& proc, bjit::Value lhs) {
@@ -185,6 +185,7 @@ static const GDScriptJit::TypeInfo* _builtin_type_info_from() {
         static GDScriptJit::TypeInfo type_info {                       \
             typeid(m_native).hash_code(),                              \
             m_v_type,                                                  \
+            sizeof(m_native),                                          \
             { _UNPACK m_fields }                                       \
         };                                                             \
         return &type_info;                                             \

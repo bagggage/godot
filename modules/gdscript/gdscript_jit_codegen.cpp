@@ -532,6 +532,41 @@ void GDScriptJitCodeGenerator::write_set_member(const Address &p_value, const St
 }
 
 void GDScriptJitCodeGenerator::write_get_member(const Address &p_target, const StringName &p_name) {
+	ValueRef& target = get_value_ref(p_target);
+	print_line("get member:", p_name, "->", Variant::get_type_name(target.type->variant_type));
+
+	const MemberInfo member_info = get_member_info(p_name);
+	const GDScriptJit::TypeInfo* type_info = GDScriptJit::TypeInfo::from_variant(member_info.type);
+
+	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
+
+	if (member_info.index >= 0) {
+		ERR_FAIL_MSG("Get member for script members is not implemented");
+	} else if (member_info.getter) {
+		print_line("\tmethod bind getter");
+		emit_function_call(
+			_method_bind_validated_call_wrapper,
+			proc.lcu((uintptr_t)member_info.getter),
+			proc.env[ENV_INSTANCE],
+			proc.lci(0),
+			jit_target_ptr
+		);
+	} else {
+		print_line("\tgetter wrapper");
+		emit_function_call(
+			_variant_get_member_wrapper,
+			proc.env[ENV_INSTANCE],
+			emit_name_ptr(p_name),
+			jit_target_ptr
+		);
+	}
+
+	if (type_info) {
+		target.drop_cached();
+		target.type = type_info;
+	} else {
+		target.evaluate(Variant::NIL);
+	}
 }
 
 void GDScriptJitCodeGenerator::write_set_static_variable(const Address &p_value, const Address &p_class, int p_index) {
@@ -548,7 +583,10 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 	ValueRef& target = get_value_ref(p_target);
 
 	print_line("assign", Variant::get_type_name(target.type->variant_type), ":=", Variant::get_type_name(source.type->variant_type));
-	if (source.type->is_native() && (!target.type->is_dynamic() || target.is_nil())) {
+
+	if (target.type->is_dynamic() && !target.is_nil()) goto dynamic_assign;
+
+	if (source.type->is_native()) {
 		print_line("\tnative");
 		if (source.type != target.type) {
 			if (target.type->is_native()) {
@@ -559,15 +597,33 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 				target.update_type(source.type->variant_type);
 				target.update_value(emit_get_native(source));
 			} else {
-				// FIXME: Implement
-				ERR_FAIL_MSG("Assign \'dynamic = native\' is not implemented");
+				goto dynamic_assign;
 			}
-		} else {
-			target.update_value(emit_get_native(source));
+			return;
 		}
-		return;
-	}
+		target.update_value(emit_get_native(source));
+	} else if (source.type->is_builtin()) {
+		print_line("\tbuiltin");
+		target.drop_cached();
 
+		try_alloc_variant_object(source);
+		try_alloc_variant_object(target);
+
+		GDScriptJit::memcpy_aligned(
+			proc, target.ptr,
+			target.offset + _variant_data_field_offset,
+			source.ptr,
+			source.offset + _variant_data_field_offset,
+			source.type->size
+		);
+
+		if (source.type != target.type) {
+			target.update_type(source.type->variant_type);
+		}
+	}
+	return;
+
+dynamic_assign:
 	print_line("\twrapper call");
 	emit_function_call(
 		_variant_assign_wrapper,
@@ -580,6 +636,10 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 }
 
 void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
+	ValueRef& target = get_value_ref(p_target);
+
+	target.drop_cached();
+	target.update_type(Variant::NIL);
 }
 
 void GDScriptJitCodeGenerator::write_assign_true(const Address &p_target) {
@@ -648,7 +708,7 @@ void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const
 		emit_name_ptr(p_function),
 		jit_target_ptr,
 		jit_args,
-		proc.lcu(p_arguments.size())
+		proc.lci(p_arguments.size())
 	);
 }
 
