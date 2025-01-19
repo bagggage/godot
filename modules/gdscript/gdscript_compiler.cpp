@@ -35,6 +35,10 @@
 #include "gdscript_cache.h"
 #include "gdscript_utility_functions.h"
 
+#ifdef DEBUG_ENABLED
+#include "gdscript_jit_codegen.h"
+#endif
+
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
 
@@ -2253,7 +2257,19 @@ Error GDScriptCompiler::_parse_block(CodeGen &codegen, const GDScriptParser::Sui
 GDScriptFunction *GDScriptCompiler::_parse_function(Error &r_error, GDScript *p_script, const GDScriptParser::ClassNode *p_class, const GDScriptParser::FunctionNode *p_func, bool p_for_ready, bool p_for_lambda) {
 	r_error = OK;
 	CodeGen codegen;
+
+#ifdef DEBUG_ENABLED
+	print_line("_parse_function called...");
+	bool jit_enabled = GLOBAL_DEF("gdscript/experimental/jit_compilation", true);
+
+	if (jit_enabled) {
+		codegen.generator = memnew(GDScriptJitCodeGenerator);
+	} else {
+		codegen.generator = memnew(GDScriptByteCodeGenerator);
+	}
+#else
 	codegen.generator = memnew(GDScriptByteCodeGenerator);
+#endif
 
 	codegen.class_node = p_class;
 	codegen.script = p_script;

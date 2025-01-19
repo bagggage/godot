@@ -32,6 +32,7 @@
 #include "gdscript_function.h"
 #include "gdscript_lambda_callable.h"
 
+#include "core/config/project_settings.h"
 #include "core/os/os.h"
 
 #ifdef DEBUG_ENABLED
@@ -474,6 +475,16 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	OPCODES_TABLE;
 
 	if (!_code_ptr) {
+		bool is_jit_enabled = GLOBAL_GET("gdscript/experimental/jit_compilation");
+		if (is_jit_enabled && _jit_function) {
+			_jit_function(
+				p_instance ? p_instance->owner : nullptr,
+				p_instance ? p_instance->members.ptrw() : nullptr,
+				_constants_ptr,
+				p_args
+			);
+		}
+
 		return _get_default_variant_for_data_type(return_type);
 	}
 
