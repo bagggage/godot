@@ -477,12 +477,35 @@ Variant GDScriptFunction::call(GDScriptInstance *p_instance, const Variant **p_a
 	if (!_code_ptr) {
 		bool is_jit_enabled = GLOBAL_GET("gdscript/experimental/jit_compilation");
 		if (is_jit_enabled && _jit_function) {
+#ifdef DEBUG_ENABLED
+			uint64_t function_start_time = 0;
+			uint64_t function_call_time = 0;
+
+			if (GDScriptLanguage::get_singleton()->profiling) {
+				function_start_time = OS::get_singleton()->get_ticks_usec();
+				function_call_time = 0;
+				profile.call_count.increment();
+				profile.frame_call_count.increment();
+			}
+#endif
 			_jit_function(
 				p_instance ? p_instance->owner : nullptr,
 				p_instance ? p_instance->members.ptrw() : nullptr,
 				_constants_ptr,
 				p_args
 			);
+#ifdef DEBUG_ENABLED
+			if (GDScriptLanguage::get_singleton()->profiling) {
+				uint64_t time_taken = OS::get_singleton()->get_ticks_usec() - function_start_time;
+				profile.total_time.add(time_taken);
+				profile.self_time.add(time_taken - function_call_time);
+				profile.frame_total_time.add(time_taken);
+				profile.frame_self_time.add(time_taken - function_call_time);
+				if (Thread::get_caller_id() == Thread::get_main_id()) {
+					GDScriptLanguage::get_singleton()->script_frame_time += time_taken - function_call_time;
+				}
+			}
+#endif
 		}
 
 		return _get_default_variant_for_data_type(return_type);
