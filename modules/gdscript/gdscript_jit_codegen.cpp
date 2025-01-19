@@ -341,8 +341,6 @@ void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Varian
 	ValueRef& target = get_value_ref(p_target);
 	print_line("type adjust:", Variant::get_type_name(target.type->variant_type), "->", Variant::get_type_name(p_new_type));
 
-	target.update_type(p_new_type);
-
 	if (target.type->is_dynamic()) {
 		// TODO: Destruct
 		target.state = ValueRef::UNCHANGED;
@@ -353,6 +351,8 @@ void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Varian
 		);
 		return;
 	}
+
+	target.evaluate(p_new_type);
 }
 
 void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Variant::Operator p_operator, const Address &p_left_operand) {
@@ -385,10 +385,10 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 	if (operand.type->variant_type != Variant::NIL) {
 		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type->variant_type, Variant::NIL);
 		print_line("\tresult type:", Variant::get_type_name(ret_type));
-		target.update_type(ret_type);
+		target.evaluate(ret_type);
 	} else {
 		print_line("\tresult type: unknown (nil)");
-		target.update_type(Variant::NIL);
+		target.evaluate(Variant::NIL);
 	}
 
 	emit_function_call(
@@ -441,10 +441,10 @@ void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Va
 		if (lhs.type->variant_type != Variant::NIL && rhs.type->variant_type != Variant::NIL) {
 			Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type->variant_type, rhs.type->variant_type);
 			print_line("\tresult type:", Variant::get_type_name(ret_type));
-			target.update_type(ret_type);
+			target.evaluate(ret_type);
 		} else {
 			print_line("\tresult type: unknown (nil)");
-			target.update_type(Variant::NIL);
+			target.evaluate(Variant::NIL);
 		}
 
 		emit_function_call(
@@ -607,15 +607,15 @@ void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const
 
 	ValueRef* target = is_return ? &get_value_ref(p_target) : nullptr;
 
-	bjit::Value jit_target_ptr = is_return ? emit_ptr_to_object(*target) : proc.lci(0);
 	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
-
-	if (is_return) {
-		target->update_type(Variant::get_utility_function_return_type(p_function));
-	}
+	bjit::Value jit_target_ptr = is_return ? emit_ptr_to_object(*target) : proc.lci(0);
 
 	Variant::ValidatedUtilityFunction utility_func = Variant::get_validated_utility_function(p_function);
 	if (utility_func) {
+		if (is_return) {
+			target->update_type(Variant::get_utility_function_return_type(p_function));
+		}
+
 		print_line("\tvalidated");
 		emit_function_call(
 			utility_func,
@@ -624,6 +624,10 @@ void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const
 			proc.lcu(p_arguments.size())
 		);
 		return;
+	}
+
+	if (is_return) {
+		target->evaluate(Variant::get_utility_function_return_type(p_function));
 	}
 
 	emit_function_call(

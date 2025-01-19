@@ -124,6 +124,11 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			cached.index = 0;
 		}
 
+		_FORCE_INLINE_ void evaluate(const Variant::Type p_type) {
+			type = GDScriptJit::TypeInfo::from_variant(p_type);
+			state = UNCHANGED;
+		}
+
 		_FORCE_INLINE_ void update_type(const Variant::Type p_type) {
 			if (p_type == type->variant_type) return;
 
@@ -325,7 +330,9 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			} break;
 			case ValueRef::CONSTANT: {
 				int index = function->constants.size();
-				function->constants.push_back(constant_values.find(&p_value));
+				const Variant& value = constant_values.find(&p_value)->get();
+				function->constants.push_back(value);
+				print_line("allocate constant:", Variant::get_type_name(value.get_type()), "(", value, ")");
 				p_value.ptr = proc.env[ENV_CONSTANTS];
 				p_value.offset = sizeof(Variant) * index;
 			} break;
