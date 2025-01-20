@@ -193,6 +193,8 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	bjit::Module jit_module;
 	bjit::Proc proc = bjit::Proc(0, "iiii");
 
+	Vector<bjit::Label> jit_labels;
+
 	List<RBMap<StringName, int>> stack_id_stack;
 	RBMap<StringName, int> stack_identifiers;
 	List<int> stack_identifiers_counts;
@@ -331,6 +333,11 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				ERR_FAIL_V_MSG({0}, "Native value expected");
 				break;
 		}
+	}
+
+	void rename_temporary(ValueRef& p_target, ValueRef& p_temp) {
+		DEV_ASSERT(p_temp.mode == ValueRef::TEMPORARY);
+		// TODO: Complete implementation
 	}
 
 	const Variant& get_constant_value(const ValueRef& p_value) {

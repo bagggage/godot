@@ -604,9 +604,33 @@ void GDScriptJitCodeGenerator::write_get_member(const Address &p_target, const S
 }
 
 void GDScriptJitCodeGenerator::write_set_static_variable(const Address &p_value, const Address &p_class, int p_index) {
+	ValueRef& value = get_value_ref(p_value);
+
+	// FIXME: Test it!
+	Variant* target_ptr = &function->_script->static_variables.ptrw()[p_index];
+
+	bjit::Value jit_value_ptr = emit_ptr_to_object(value);
+
+	emit_function_call(
+		_variant_assign_wrapper,
+		proc.lcu((uintptr_t)target_ptr),
+		jit_value_ptr
+	);
 }
 
 void GDScriptJitCodeGenerator::write_get_static_variable(const Address &p_target, const Address &p_class, int p_index) {
+	ValueRef& target = get_value_mut_ref(p_target);
+
+	// FIXME: Test it!
+	Variant* value_ptr = &function->_script->static_variables.ptrw()[p_index];
+
+	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
+
+	emit_function_call(
+		_variant_assign_wrapper,
+		jit_target_ptr,
+		proc.lcu((uintptr_t)value_ptr)
+	);
 }
 
 void GDScriptJitCodeGenerator::write_assign_with_conversion(const Address &p_target, const Address &p_source) {
@@ -677,9 +701,13 @@ void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
 }
 
 void GDScriptJitCodeGenerator::write_assign_true(const Address &p_target) {
+	ValueRef& target = get_value_mut_ref(p_target);
+	emit_set_native(target, Variant::BOOL, proc.lci(1));
 }
 
 void GDScriptJitCodeGenerator::write_assign_false(const Address &p_target) {
+	ValueRef& target = get_value_mut_ref(p_target);
+	emit_set_native(target, Variant::BOOL, proc.lci(0));
 }
 
 void GDScriptJitCodeGenerator::write_assign_default_parameter(const Address &p_dst, const Address &p_src, bool p_use_conversion) {
@@ -798,12 +826,31 @@ void GDScriptJitCodeGenerator::write_await(const Address &p_target, const Addres
 }
 
 void GDScriptJitCodeGenerator::write_if(const Address &p_condition) {
+	ValueRef& condition = get_value_ref(p_condition);
+
+	DEV_ASSERT(condition.type->variant_type == Variant::BOOL);
+
+	int lable_idx = jit_labels.size();
+	jit_labels.resize(jit_labels.size() + 3);
+
+	jit_labels.write[lable_idx]     = proc.newLabel(); // true case
+	jit_labels.write[lable_idx + 1] = proc.newLabel(); // false case
+	jit_labels.write[lable_idx + 2] = proc.newLabel(); // after
+
+	proc.jnz(emit_get_native(condition), jit_labels[lable_idx], jit_labels[lable_idx + 1]);
+	proc.emitLabel(jit_labels[lable_idx]);
 }
 
 void GDScriptJitCodeGenerator::write_else() {
+	proc.jmp(jit_labels[jit_labels.size() - 1]);
+	proc.emitLabel(jit_labels[jit_labels.size() - 2]);
 }
 
 void GDScriptJitCodeGenerator::write_endif() {
+	proc.jmp(jit_labels[jit_labels.size() - 1]);
+	proc.emitLabel(jit_labels[jit_labels.size() - 1]);
+
+	jit_labels.resize(jit_labels.size() - 3);
 }
 
 void GDScriptJitCodeGenerator::write_jump_if_shared(const Address &p_value) {
