@@ -167,7 +167,77 @@ struct NativeBinaryOperators {
             )
         );
     }
+
+    static bjit::Value eql(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
+        const bjit::Value casted_rhs = cast_r(proc, rhs);
+        return is_float ? proc.deq(casted_lhs, casted_rhs) : proc.ieq(casted_lhs, casted_rhs);
+    }
+    static bjit::Value neql(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
+        const bjit::Value casted_rhs = cast_r(proc, rhs);
+        return is_float ? proc.dne(casted_lhs, casted_rhs) : proc.ine(casted_lhs, casted_rhs);
+    }
+    static bjit::Value less(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
+        const bjit::Value casted_rhs = cast_r(proc, rhs);
+        return is_float ? proc.dlt(casted_lhs, casted_rhs) : proc.ilt(casted_lhs, casted_rhs);
+    }
+    static bjit::Value leq(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
+        const bjit::Value casted_rhs = cast_r(proc, rhs);
+        return is_float ? proc.dle(casted_lhs, casted_rhs) : proc.ile(casted_lhs, casted_rhs);
+    }
+    static bjit::Value great(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
+        const bjit::Value casted_rhs = cast_r(proc, rhs);
+        return is_float ? proc.dgt(casted_lhs, casted_rhs) : proc.igt(casted_lhs, casted_rhs);
+    }
+    static bjit::Value geq(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = cast_l(proc, lhs);
+        const bjit::Value casted_rhs = cast_r(proc, rhs);
+        return is_float ? proc.dge(casted_lhs, casted_rhs) : proc.ige(casted_lhs, casted_rhs);
+    }
+    static bjit::Value bit_and(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = GDScriptJit::cast_to<int64_t, L>(proc, lhs);
+        const bjit::Value casted_rhs = GDScriptJit::cast_to<int64_t, R>(proc, rhs);
+        return proc.iand(casted_lhs, casted_rhs);
+    }
+    static bjit::Value bit_or(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = GDScriptJit::cast_to<int64_t, L>(proc, lhs);
+        const bjit::Value casted_rhs = GDScriptJit::cast_to<int64_t, R>(proc, rhs);
+        return proc.ior(casted_lhs, casted_rhs);
+    }
+    static bjit::Value bit_xor(bjit::Proc& proc, bjit::Value lhs, bjit::Value rhs) {
+        const bjit::Value casted_lhs = GDScriptJit::cast_to<int64_t, L>(proc, lhs);
+        const bjit::Value casted_rhs = GDScriptJit::cast_to<int64_t, R>(proc, rhs);
+        return proc.ixor(casted_lhs, casted_rhs);
+    }
 };
+
+//template<typename T>
+//struct VectorOperators {
+//    template<typename S>
+//    static bjit::Value mul_scalar(bjit::Proc& proc, bjit::Value ptr, unsigned offset, bjit::Value scalar) {
+//        using GDScriptJit;
+//        using R = ReturnType<T, S>;
+//        using Ops = NativeBinaryOperators<T, S>;
+//
+//        store_to_memory<T>(
+//            proc, cast_to<T, R>(proc, Ops::mul(proc, load_from_memory<T>(proc, ptr, offset), scalar)),
+//            ptr, offset
+//        );
+//        store_to_memory<T>(
+//            proc, cast_to<T, R>(proc, Ops::mul(proc, load_from_memory<T>(proc, ptr, offset + sizeof(T)), scalar)),
+//            ptr, offset + sizeof(T)
+//        );
+//        store_to_memory<T>(
+//            proc,
+//            cast_to<T, R>(proc, Ops::mul(proc, load_from_memory<T>(proc, ptr, offset + sizeof(T) * 2), scalar)),
+//            ptr, offset + sizeof(T) * 2
+//        );
+//    }
+//};
 
 template<typename NativeT>
 static const GDScriptJit::TypeInfo* _builtin_type_info_from() {
@@ -258,8 +328,18 @@ GDScriptJit::binary_operators_table[Variant::VARIANT_MAX][Variant::VARIANT_MAX][
     GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_MODULE]   = &NativeBinaryOperators<m_l_n,m_r_n>::mod; \
     GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_POWER]    = &NativeBinaryOperators<m_l_n,m_r_n>::pow; \
     \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_LEFT]  = &NativeBinaryOperators<m_l_n,m_r_n>::shift_left; \
-    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_RIGHT] = &NativeBinaryOperators<m_l_n,m_r_n>::shift_right;
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_LEFT]  = &NativeBinaryOperators<m_l_n,m_r_n>::shift_left;  \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SHIFT_RIGHT] = &NativeBinaryOperators<m_l_n,m_r_n>::shift_right; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_AND]         = &NativeBinaryOperators<m_l_n,m_r_n>::bit_and;     \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_OR]          = &NativeBinaryOperators<m_l_n,m_r_n>::bit_or;      \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_XOR]         = &NativeBinaryOperators<m_l_n,m_r_n>::bit_xor;     \
+    \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_EQUAL]         = &NativeBinaryOperators<m_l_n,m_r_n>::eql;  \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_NOT_EQUAL]     = &NativeBinaryOperators<m_l_n,m_r_n>::neql; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_LESS]          = &NativeBinaryOperators<m_l_n,m_r_n>::less; \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_LESS_EQUAL]    = &NativeBinaryOperators<m_l_n,m_r_n>::leq;  \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_GREATER]       = &NativeBinaryOperators<m_l_n,m_r_n>::eql;  \
+    GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_GREATER_EQUAL] = &NativeBinaryOperators<m_l_n,m_r_n>::eql;
 
 void GDScriptJit::TypeInfo::register_native_operators() {
     memset(unary_operators_table, 0, sizeof(unary_operators_table));
