@@ -310,6 +310,8 @@ GDScriptFunction *GDScriptJitCodeGenerator::write_end() {
 		proc.iret(proc.lcu(0));
 		proc_index = jit_module.compile(proc);
 
+		// Hexdump of machine code.
+		print_line("machine code:");
 		String text;
 		for (auto byte : jit_module.getBytes()) {
 			text += vformat("%02x ", byte);
@@ -349,7 +351,7 @@ void GDScriptJitCodeGenerator::write_type_adjust(const Address &p_target, Varian
 		target.drop_cached();
 		target.update_type(p_new_type);
 	} else {
-		// TODO: Destruct
+		// TODO: Destruct ?
 		target.state = ValueRef::UNCHANGED;
 		emit_function_call(
 			VariantInternal::initialize,
@@ -511,6 +513,8 @@ void GDScriptJitCodeGenerator::write_set_named(const Address &p_target, const St
 	bjit::Value jit_source_ptr = emit_ptr_to_object(get_value_ref(p_source));
 	bjit::Value jit_target_ptr = emit_ptr_to_object(get_value_mut_ref(p_target));
 
+	// TODO: Implement some optimizations?
+
 	emit_function_call(
 		_variant_set_named_wrapper,
 		jit_target_ptr,
@@ -525,6 +529,8 @@ void GDScriptJitCodeGenerator::write_get_named(const Address &p_target, const St
 
 	bjit::Value jit_source_ptr = emit_ptr_to_object(source);
 	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
+
+	// TODO: Implement some optimizations?
 
 	target.update_type(Variant::get_member_type(source.type->variant_type, p_name));
 
@@ -910,45 +916,10 @@ void GDScriptJitCodeGenerator::clear_temporaries() {
 }
 
 void GDScriptJitCodeGenerator::clear_address(const Address &p_address) {
-	// Do not check `is_local_dirty()` here! Always clear the address since the codegen doesn't track the compiler.
-	// Also, this method is used to initialize local variables of built-in types, since they cannot be `null`.
-
-	if (p_address.type.has_type && p_address.type.kind == GDScriptDataType::BUILTIN) {
-		switch (p_address.type.builtin_type) {
-			case Variant::BOOL:
-				write_assign_false(p_address);
-				break;
-			case Variant::DICTIONARY:
-				if (p_address.type.has_container_element_types()) {
-					write_construct_typed_dictionary(p_address, p_address.type.get_container_element_type_or_variant(0), p_address.type.get_container_element_type_or_variant(1), Vector<GDScriptCodeGenerator::Address>());
-				} else {
-					write_construct(p_address, p_address.type.builtin_type, Vector<GDScriptCodeGenerator::Address>());
-				}
-				break;
-			case Variant::ARRAY:
-				if (p_address.type.has_container_element_type(0)) {
-					write_construct_typed_array(p_address, p_address.type.get_container_element_type(0), Vector<GDScriptCodeGenerator::Address>());
-				} else {
-					write_construct(p_address, p_address.type.builtin_type, Vector<GDScriptCodeGenerator::Address>());
-				}
-				break;
-			case Variant::NIL:
-			case Variant::OBJECT:
-				write_assign_null(p_address);
-				break;
-			default:
-				write_construct(p_address, p_address.type.builtin_type, Vector<GDScriptCodeGenerator::Address>());
-				break;
-		}
-	} else {
-		write_assign_null(p_address);
-	}
-
-	if (p_address.mode == Address::LOCAL_VARIABLE) {
-		dirty_locals.erase(p_address.address);
-	}
+	// TODO
 }
 
+// FIXME: This code copied from `gdscript_byte_codegen.cpp`
 // Returns `true` if the local has been reused and not cleaned up with `clear_address()`.
 bool GDScriptJitCodeGenerator::is_local_dirty(const Address &p_address) const {
 	ERR_FAIL_COND_V(p_address.mode != Address::LOCAL_VARIABLE, false);

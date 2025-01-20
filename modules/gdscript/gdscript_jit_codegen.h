@@ -195,14 +195,15 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 	Vector<bjit::Label> jit_labels;
 
+	// FIXME: Remove this? Actually unused.
 	List<RBMap<StringName, int>> stack_id_stack;
 	RBMap<StringName, int> stack_identifiers;
 	List<int> stack_identifiers_counts;
 	RBMap<StringName, int> local_constants;
 
 	Vector<ValueRef> locals;
-	HashSet<int> dirty_locals;
-
+	HashSet<int> dirty_locals; // Unused for now.
+ 
 	Vector<int> temporaries;
 	Vector<int> temporaries_pool;
 
@@ -291,6 +292,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
+	// TODO: For the future optimizations...
 	ValueRef& get_value_mut_ref(const Address& p_address) {
 		return get_value_ref(p_address);
 	}
@@ -335,6 +337,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
+	// TODO: For the future optimizations...
 	void rename_temporary(ValueRef& p_target, ValueRef& p_temp) {
 		DEV_ASSERT(p_temp.mode == ValueRef::TEMPORARY);
 		// TODO: Complete implementation
