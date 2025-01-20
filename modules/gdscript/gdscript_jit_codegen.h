@@ -150,6 +150,27 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				state = VALUE_CHANGED;
 			}
 		}
+
+		String stringify() const {
+			String result = Variant::get_type_name(type->variant_type);
+			result += '(';
+			switch (mode) {
+				case LOCAL: result += "local:"; break;		
+				case TEMPORARY: result += "temp:"; break;
+				case ARGUMENT: result += "arg:"; break;
+				case CONSTANT: result += "const:"; break;
+				case EXTERNAL: result += "extern:"; break;
+			}
+
+			if (offset >= 0) {
+				result += itos(offset / sizeof(Variant));
+			} else {
+				result += "cache";	
+			}
+
+			result += ')';
+			return result;
+		}
 	};
 
 	struct MemberInfo {
@@ -186,7 +207,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	Vector<ValueRef> constants;
 	Vector<ValueRef> arguments;
 
-	RBMap<const ValueRef *, Variant> constant_values;
+	RBMap<int, Variant> constant_values;
 	HashMap<Variant, int, VariantHasher, VariantComparator> constant_map;
 	RBMap<StringName, int> name_map;
 
@@ -268,6 +289,10 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
+	ValueRef& get_value_mut_ref(const Address& p_address) {
+		return get_value_ref(p_address);
+	}
+
 	void store_native(ValueRef& p_value) {
 		DEV_ASSERT(p_value.type->is_native());
 		const unsigned offset = p_value.offset + _variant_data_field_offset;
@@ -308,10 +333,15 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
+	const Variant& get_constant_value(const ValueRef& p_value) {
+		const unsigned index = ((uintptr_t)&p_value - (uintptr_t)constants.ptr()) / sizeof(ValueRef);
+		return constant_values.find(index)->get();
+	}
+
 	bjit::Value load_native_constant(const ValueRef& p_value) {
 		DEV_ASSERT(p_value.type->is_native());
-		const Variant& variant = constant_values.find(&p_value)->get();
-
+		const Variant& variant = get_constant_value(p_value);
+		
 		switch (p_value.type->variant_type) {
 			case Variant::BOOL:
 			case Variant::INT:
@@ -404,8 +434,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			} break;
 			case ValueRef::CONSTANT: {
 				int index = function->constants.size();
-				const Variant& value = constant_values.find(&p_value)->get();
-				function->constants.push_back(value);
+				function->constants.push_back(get_constant_value(p_value));
 				p_value.ptr = proc.env[ENV_CONSTANTS];
 				p_value.offset = sizeof(Variant) * index;
 			} break;
@@ -478,6 +507,15 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		return proc.iadd(p_value.ptr, proc.lcu((p_value.offset > 0 ? p_value.offset : 0) + _variant_data_field_offset));
 	}
 
+	bjit::Value emit_load_ptr_args(const Address& p_arg)  {
+		const unsigned argptrs_offset = stack_top * sizeof(Variant);
+		proc.si64(
+			emit_ptr_to_object(get_value_ref(p_arg)),
+			jit_sp, argptrs_offset
+		);
+		return proc.iadd(jit_sp, proc.lcu(argptrs_offset));
+	}
+
 	bjit::Value emit_load_ptr_args(const Vector<Address>& p_args) {
 		if (p_args.size() == 0) return proc.lci(0);
 
@@ -488,9 +526,9 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			jit_ptrs.write[i] = emit_ptr_to_object(get_value_ref(p_args[i]));
 		}
 
-		bjit::Value jit_ptr_args = proc.iadd(jit_sp, proc.lcu(stack_top * sizeof(Variant)));
+		const unsigned argptrs_offset = stack_top * sizeof(Variant);
 		for (int i = 0; i < p_args.size(); ++i) {
-			proc.si64(jit_ptrs[i], jit_ptr_args, i * sizeof(uintptr_t));
+			proc.si64(jit_ptrs[i], jit_sp, argptrs_offset + (i * sizeof(uintptr_t)));
 		}
 
 		int _stack_slots = ((p_args.size() + 1) * sizeof(Variant*)) / sizeof(Variant);
@@ -498,7 +536,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			max_stack_size = stack_top + _stack_slots;
 		}
 	
-		return jit_ptr_args;
+		return proc.iadd(jit_sp, proc.lcu(argptrs_offset));
 	}
 
 	template<typename R, typename... FuncArgs, typename... JitArgs>
