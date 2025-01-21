@@ -49,7 +49,7 @@ public:
 		Variant::Type variant_type = Variant::VARIANT_MAX;
 		unsigned size = 0;
 
-		HashMap<StringName, FieldInfo> fields;
+		HashMap<String, FieldInfo> fields;
 	private:
 		static HashMap<Variant::Type, const TypeInfo*> variant_map;
 		static HashMap<size_t, const TypeInfo*> typeid_map;
@@ -82,6 +82,9 @@ public:
 		}
 		_FORCE_INLINE_ bool is_dynamic() const {
 			return !is_native() && !is_builtin();
+		}
+		_FORCE_INLINE_ bool is_nil() const {
+			return variant_type == Variant::NIL;
 		}
 		_FORCE_INLINE_ bool is_variant() const {
 			return variant_type != Variant::VARIANT_MAX;

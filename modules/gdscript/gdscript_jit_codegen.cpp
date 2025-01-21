@@ -510,8 +510,44 @@ void GDScriptJitCodeGenerator::write_get(const Address &p_target, const Address 
 }
 
 void GDScriptJitCodeGenerator::write_set_named(const Address &p_target, const StringName &p_name, const Address &p_source) {
-	bjit::Value jit_source_ptr = emit_ptr_to_object(get_value_ref(p_source));
-	bjit::Value jit_target_ptr = emit_ptr_to_object(get_value_mut_ref(p_target));
+	ValueRef& source = get_value_ref(p_source);
+	ValueRef& target = get_value_mut_ref(p_target);
+
+	print_line("set named:", target.stringify() + "." + p_name, ":=", source.stringify());
+
+	if (target.type->is_builtin()) {
+		if (!target.type->fields.has(p_name)) goto wrapper_call;
+		const GDScriptJit::TypeInfo::FieldInfo& field_info = target.type->fields.get(p_name);
+
+		if (field_info.type->is_native() && source.type->is_native()) {
+			print_line("\tnative");
+			try_alloc_variant_object(target);
+
+			bjit::Value jit_casted = emit_cast_native(emit_get_native(source), source.type, field_info.type);
+			store_native(jit_casted, target.ptr, field_info.type, target.get_data_offset() + field_info.offset);
+		} else if (field_info.type->is_builtin() && source.type == field_info.type) {
+			print_line("\tbuiltin");
+			try_alloc_variant_object(source);
+			try_alloc_variant_object(target);
+
+			GDScriptJit::memcpy_aligned(
+				proc, target.ptr,
+				target.get_data_offset() + field_info.offset,
+				source.ptr,
+				source.get_data_offset(),
+				field_info.type->size
+			);
+		} else {
+			goto wrapper_call;
+		}
+		return;
+	}
+
+wrapper_call:
+	print_line("\twrapper");
+
+	bjit::Value jit_source_ptr = emit_ptr_to_object(source);
+	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
 
 	// TODO: Implement some optimizations?
 
@@ -527,10 +563,41 @@ void GDScriptJitCodeGenerator::write_get_named(const Address &p_target, const St
 	ValueRef& source = get_value_ref(p_source);
 	ValueRef& target = get_value_mut_ref(p_target);
 
+	print_line("get named:", target.stringify(), ":=", source.stringify() + "." + p_name);
+
+	if (source.type->is_builtin()) {
+		if (!source.type->fields.has(p_name)) goto wrapper_call;
+		const GDScriptJit::TypeInfo::FieldInfo& field_info = source.type->fields.get(p_name);
+
+		if (field_info.type->is_native() && (target.type->is_native() || target.type->is_nil())) {
+			print_line("\tnative");
+			try_alloc_variant_object(source);
+
+			bjit::Value jit_value = load_native(source.ptr, field_info.type, source.get_data_offset() + field_info.offset);
+			jit_value = emit_cast_native(jit_value, field_info.type, target.type);
+			emit_set_native(target, target.type->variant_type, jit_value);
+		} else if (field_info.type->is_builtin() && target.type == field_info.type) {
+			print_line("\tbuiltin");
+			try_alloc_variant_object(target);
+			try_alloc_variant_object(source);
+
+			GDScriptJit::memcpy_aligned(
+				proc, target.ptr,
+				target.get_data_offset(),
+				source.ptr,
+				source.get_data_offset() + field_info.offset,
+				field_info.type->size
+			);
+		} else {
+			goto wrapper_call;
+		}
+		return;
+	}
+
+wrapper_call:
+	print_line("\twrapper");
 	bjit::Value jit_source_ptr = emit_ptr_to_object(source);
 	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
-
-	// TODO: Implement some optimizations?
 
 	target.update_type(Variant::get_member_type(source.type->variant_type, p_name));
 
@@ -547,7 +614,6 @@ void GDScriptJitCodeGenerator::write_set_member(const Address &p_value, const St
 	print_line("set member:", p_name, "<-", value.stringify());
 
 	const MemberInfo member_info = get_member_info(p_name);
-	const GDScriptJit::TypeInfo* type_info = GDScriptJit::TypeInfo::from_variant(member_info.type);
 
 	if (member_info.index >= 0) {
 		ERR_FAIL_MSG("Set member for script members is not implemented");	
@@ -648,18 +714,17 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 
 	print_line("assign", target.stringify(), ":=", source.stringify());
 
-	if (target.type->is_dynamic() && !target.is_nil()) goto dynamic_assign;
+	if (target.type->is_dynamic() && !target.type->is_nil()) goto dynamic_assign;
 
 	if (source.type->is_native()) {
 		print_line("\tnative");
 		if (source.type != target.type) {
 			if (target.type->is_native()) {
 				// Cast.
-				target.update_value(emit_cast_native(source, target.type->variant_type));
-			} else if (target.is_nil() && target.can_be_cached()) {
+				target.update_value(emit_cast_native(emit_get_native(source), source.type, target.type));
+			} else if (target.type->is_nil() && target.can_be_cached()) {
 				// Assign with type change.
-				target.update_type(source.type->variant_type);
-				target.update_value(emit_get_native(source));
+				emit_set_native(target, source.type->variant_type, emit_get_native(source));
 			} else {
 				goto dynamic_assign;
 			}
