@@ -120,16 +120,16 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			return cached.index != 0;
 		}
 
-		_FORCE_INLINE_ bool is_nil() const {
-			return type->variant_type == Variant::NIL;
-		}
-
 		_FORCE_INLINE_ bool can_be_cached() const {
 			return mode < CONSTANT;
 		}
 
 		_FORCE_INLINE_ void drop_cached() {
 			cached.index = 0;
+		}
+
+		_FORCE_INLINE_ unsigned get_data_offset() const {
+			return offset + _variant_data_field_offset;
 		}
 
 		_FORCE_INLINE_ void evaluate(const Variant::Type p_type) {
@@ -297,19 +297,24 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		return get_value_ref(p_address);
 	}
 
-	void store_native(ValueRef& p_value) {
-		DEV_ASSERT(p_value.type->is_native());
-		const unsigned offset = p_value.offset + _variant_data_field_offset;
+	void store_native(bjit::Value p_value, bjit::Value p_ptr, const GDScriptJit::TypeInfo* p_type, unsigned offset) {
+		if (p_type->is_same<float>()) {
+			GDScriptJit::store_to_memory<float>(proc, p_value, p_ptr, offset);
+			return;
+		} else if (p_type->is_same<int>()) {
+			GDScriptJit::store_to_memory<int>(proc, p_value, p_ptr, offset);
+			return;
+		}
 
-		switch (p_value.type->variant_type) {
+		switch (p_type->variant_type) {
 			case Variant::BOOL:
-				GDScriptJit::store_to_memory<bool>(proc, p_value.cached, p_value.ptr, offset);
+				GDScriptJit::store_to_memory<bool>(proc, p_value, p_ptr, offset);
 				break;
 			case Variant::INT:
-				GDScriptJit::store_to_memory<int64_t>(proc, p_value.cached, p_value.ptr, offset);
+				GDScriptJit::store_to_memory<int64_t>(proc, p_value, p_ptr, offset);
 				break;
 			case Variant::FLOAT:
-				GDScriptJit::store_to_memory<double>(proc, p_value.cached, p_value.ptr, offset);
+				GDScriptJit::store_to_memory<double>(proc, p_value, p_ptr, offset);
 				break;
 			default:
 				ERR_FAIL_MSG("Native value expected");
@@ -317,19 +322,22 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
-	bjit::Value load_native(const ValueRef& p_value) {
-		DEV_ASSERT(p_value.type->is_native());
-		const unsigned offset = p_value.offset + _variant_data_field_offset;
+	bjit::Value load_native(bjit::Value p_ptr, const GDScriptJit::TypeInfo* p_type, unsigned offset) {
+		if (p_type->is_same<float>()) {
+			return GDScriptJit::load_from_memory<float>(proc, p_ptr, offset);
+		} else if (p_type->is_same<int>()) {
+			return GDScriptJit::load_from_memory<int>(proc, p_ptr, offset);
+		}
 
-		switch (p_value.type->variant_type) {
+		switch (p_type->variant_type) {
 			case Variant::BOOL:
-				return GDScriptJit::load_from_memory<bool>(proc, p_value.ptr, offset);
+				return GDScriptJit::load_from_memory<bool>(proc, p_ptr, offset);
 				break;
 			case Variant::INT:
-				return GDScriptJit::load_from_memory<int64_t>(proc, p_value.ptr, offset);
+				return GDScriptJit::load_from_memory<int64_t>(proc, p_ptr, offset);
 				break;
 			case Variant::FLOAT:
-				return GDScriptJit::load_from_memory<double>(proc, p_value.ptr, offset);
+				return GDScriptJit::load_from_memory<double>(proc, p_ptr, offset);
 				break;
 			default:
 				ERR_FAIL_V_MSG({0}, "Native value expected");
@@ -366,34 +374,40 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 	}
 
-	bjit::Value emit_cast_native(ValueRef& p_value, const Variant::Type p_target_type) {
-		const bjit::Value jit_value = emit_get_native(p_value);
+	bjit::Value emit_cast_native(bjit::Value p_value, const GDScriptJit::TypeInfo* p_type, const GDScriptJit::TypeInfo* p_target_type) {
+		if (p_type == p_target_type) return p_value;
 
-		// Specific cast from `float` and `int` (32-bit verisons).
-		if (p_value.type->is_same<float>()) {
-			switch (p_target_type) {
+		// Specific cast from `float` and `int` (32-bit versions).
+		if (p_type->is_same<float>()) {
+			if (p_target_type->is_same<int>()) {
+				return GDScriptJit::cast_to<int,float>(proc, p_value);
+			}
+
+			switch (p_target_type->variant_type) {
 				case Variant::BOOL:
-					return GDScriptJit::cast_to<bool,float>(proc, jit_value); break;
+					return GDScriptJit::cast_to<bool,float>(proc, p_value); break;
 				case Variant::INT:
-					return GDScriptJit::cast_to<int64_t,float>(proc, jit_value); break;
+					return GDScriptJit::cast_to<int64_t,float>(proc, p_value); break;
 				case Variant::FLOAT:
-					return GDScriptJit::cast_to<double,float>(proc, jit_value); break;
+					return GDScriptJit::cast_to<double,float>(proc, p_value); break;
 				default: goto inval_type;
 			}
-		} else if (p_value.type->is_same<int>()) {
-			switch (p_target_type) {
+		} else if (p_type->is_same<int>()) {
+			if (p_target_type->is_same<float>()) {
+				return GDScriptJit::cast_to<float,int>(proc, p_value);
+			}
+
+			switch (p_target_type->variant_type) {
 				case Variant::BOOL:
-					return GDScriptJit::cast_to<bool,int>(proc, jit_value); break;
+					return GDScriptJit::cast_to<bool,int>(proc, p_value); break;
 				case Variant::INT:
-					return GDScriptJit::cast_to<int64_t,int>(proc, jit_value); break;
+					return GDScriptJit::cast_to<int64_t,int>(proc, p_value); break;
 				case Variant::FLOAT:
-					return GDScriptJit::cast_to<double,int>(proc, jit_value); break;
+					return GDScriptJit::cast_to<double,int>(proc, p_value); break;
 				default: goto inval_type;
 			}
 		} else {
-			if (p_value.type->variant_type == p_target_type) return jit_value;
-
-			switch (p_value.type->variant_type) {
+			switch (p_type->variant_type) {
 				case Variant::BOOL:  goto cast_bool;
 				case Variant::INT:   goto cast_int;
 				case Variant::FLOAT: goto cast_double;
@@ -402,23 +416,41 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 
 		cast_bool: {
-			switch (p_target_type) {
-				case Variant::INT:   return GDScriptJit::cast_to<int64_t, bool>(proc, jit_value); break;
-				case Variant::FLOAT: return GDScriptJit::cast_to<double,  bool>(proc, jit_value); break;
+			if (p_target_type->is_same<float>()) {
+				return GDScriptJit::cast_to<float, bool>(proc, p_value);
+			} else if (p_target_type->is_same<int>()) {
+				return GDScriptJit::cast_to<int, bool>(proc, p_value);
+			}
+
+			switch (p_target_type->variant_type) {
+				case Variant::INT:   return GDScriptJit::cast_to<int64_t, bool>(proc, p_value); break;
+				case Variant::FLOAT: return GDScriptJit::cast_to<double,  bool>(proc, p_value); break;
 				default: goto inval_type;
 			}
 		}
 		cast_int: {
-			switch (p_target_type) {
-				case Variant::BOOL:  return GDScriptJit::cast_to<bool,    int64_t>(proc, jit_value); break;
-				case Variant::FLOAT: return GDScriptJit::cast_to<double,  int64_t>(proc, jit_value); break;
+			if (p_target_type->is_same<float>()) {
+				return GDScriptJit::cast_to<float, int64_t>(proc, p_value);
+			} else if (p_target_type->is_same<int>()) {
+				return GDScriptJit::cast_to<int, int64_t>(proc, p_value);
+			}
+
+			switch (p_target_type->variant_type) {
+				case Variant::BOOL:  return GDScriptJit::cast_to<bool,    int64_t>(proc, p_value); break;
+				case Variant::FLOAT: return GDScriptJit::cast_to<double,  int64_t>(proc, p_value); break;
 				default: goto inval_type;
 			}
 		}
 		cast_double: {
-			switch (p_target_type) {
-				case Variant::BOOL:  return GDScriptJit::cast_to<bool,    double>(proc, jit_value); break;
-				case Variant::INT:   return GDScriptJit::cast_to<int64_t, double>(proc, jit_value); break;
+			if (p_target_type->is_same<float>()) {
+				return GDScriptJit::cast_to<float, double>(proc, p_value);
+			} else if (p_target_type->is_same<int>()) {
+				return GDScriptJit::cast_to<int, double>(proc, p_value);
+			}
+
+			switch (p_target_type->variant_type) {
+				case Variant::BOOL:  return GDScriptJit::cast_to<bool,    double>(proc, p_value); break;
+				case Variant::INT:   return GDScriptJit::cast_to<int64_t, double>(proc, p_value); break;
 				default: goto inval_type;
 			}
 		}
@@ -469,7 +501,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 					);
 				}
 			case ValueRef::VALUE_CHANGED: {
-				if (p_value.is_cached()) store_native(p_value);
+				if (p_value.is_cached()) store_native(p_value.cached, p_value.ptr, p_value.type, p_value.get_data_offset());
 				p_value.state = sync_type ?
 					ValueRef::UNCHANGED :
 					(p_value.state == ValueRef::TYPE_CHANGED ? ValueRef::TYPE_CHANGED : ValueRef::UNCHANGED);
@@ -488,7 +520,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 					p_value.ptr = proc.li64(proc.env[ENV_FUNC_ARGS], p_value.offset);
 					p_value.offset = 0;
 				}
-				p_value.cached = load_native(p_value);
+				p_value.cached = load_native(p_value.ptr, p_value.type, p_value.offset);
 			}
 		}
 		return p_value.cached;
