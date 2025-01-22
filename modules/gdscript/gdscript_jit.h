@@ -93,6 +93,9 @@ public:
 		_FORCE_INLINE_ bool is_same() const {
 			return typeid(T).hash_code() == typeid_hash;
 		}
+		_FORCE_INLINE_ bool is_abi_compatible() const {
+			return this == from_variant(variant_type);
+		}
 	};
 
 	using UnaryOperatorCodeGenFunc = bjit::Value(*)(bjit::Proc& proc, bjit::Value lhs);

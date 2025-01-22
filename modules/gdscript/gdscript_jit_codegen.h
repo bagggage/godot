@@ -120,21 +120,17 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 
 		_FORCE_INLINE_ bool is_allocated() const {
-			return (mode > CONSTANT) || (offset >= 0);
+			return offset >= 0;
 		}
-
 		_FORCE_INLINE_ bool is_cached() const {
 			return cached.index != 0;
 		}
-
 		_FORCE_INLINE_ bool can_be_cached() const {
 			return mode < CONSTANT;
 		}
-
 		_FORCE_INLINE_ void drop_cached() {
 			cached.index = 0;
 		}
-
 		_FORCE_INLINE_ unsigned get_data_offset() const {
 			return offset + _variant_data_field_offset;
 		}
@@ -143,14 +139,14 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			type = GDScriptJit::TypeInfo::from_variant(p_type);
 			state = UNCHANGED;
 		}
-
 		_FORCE_INLINE_ void update_type(const Variant::Type p_type) {
-			if (p_type == type->variant_type) return;
-
-			type = GDScriptJit::TypeInfo::from_variant(p_type);
-			state = TYPE_CHANGED;
+			update_type(GDScriptJit::TypeInfo::from_variant(p_type));
 		}
+		_FORCE_INLINE_ void update_type(const GDScriptJit::TypeInfo* p_type) {
+			if (p_type->variant_type != type->variant_type) state = TYPE_CHANGED;
 
+			type = p_type;
+		}
 		_FORCE_INLINE_ void update_value(const bjit::Value p_value) {
 			cached = p_value;
 			if (state != TYPE_CHANGED) {
@@ -495,6 +491,12 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 		if (p_value.is_allocated()) return;
 
+		if (p_value.is_cached() && !p_value.type->is_abi_compatible()) {
+			const GDScriptJit::TypeInfo* abi_type = GDScriptJit::TypeInfo::from_variant(p_value.type->variant_type);
+			p_value.cached = emit_cast_native(p_value.cached, p_value.type, abi_type);
+			p_value.type = abi_type;
+		}
+
 		switch (p_value.mode) {
 			case ValueRef::LOCAL:
 			case ValueRef::TEMPORARY: {
@@ -528,10 +530,12 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 					);
 				}
 			case ValueRef::VALUE_CHANGED: {
-				if (p_value.is_cached()) store_native(p_value.cached, p_value.ptr, p_value.type, p_value.get_data_offset());
-				p_value.state = sync_type ?
-					ValueRef::UNCHANGED :
-					(p_value.state == ValueRef::TYPE_CHANGED ? ValueRef::TYPE_CHANGED : ValueRef::UNCHANGED);
+				if (p_value.is_cached()) {
+					store_native(p_value.cached, p_value.ptr, p_value.type, p_value.get_data_offset());
+					p_value.state = sync_type ?
+						ValueRef::UNCHANGED :
+						(p_value.state == ValueRef::TYPE_CHANGED ? ValueRef::TYPE_CHANGED : ValueRef::UNCHANGED);
+				}
 			} break;
 			default:
 				break;
@@ -552,8 +556,19 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		}
 		return p_value.cached;
 	}
+	bjit::Value emit_get_native_abi_compat(ValueRef& p_value) {
+		bjit::Value jit_value = emit_get_native(p_value);
+		if (!p_value.type->is_abi_compatible()) {
+			const GDScriptJit::TypeInfo* abi_type = GDScriptJit::TypeInfo::from_variant(p_value.type->variant_type);
+			jit_value = emit_cast_native(jit_value, p_value.type, abi_type);
 
-	void emit_set_native(ValueRef& p_destination, const Variant::Type p_src_type, const bjit::Value p_jit_value) {
+			p_value.type = abi_type;
+			p_value.cached = jit_value;
+		}
+		return jit_value;
+	}
+
+	void emit_set_native(ValueRef& p_destination, const GDScriptJit::TypeInfo* p_src_type, const bjit::Value p_jit_value) {
 		p_destination.update_type(p_src_type);
 		p_destination.update_value(p_jit_value);
 	}

@@ -170,12 +170,13 @@ void GDScriptJitCodeGenerator::emit_assign(ValueRef& p_target, ValueRef& p_sourc
 			p_target.update_value(emit_cast_native(emit_get_native(p_source), p_source.type, p_target.type));
 		} else if (p_target.type->is_nil() && p_target.can_be_cached()) {
 			// Assign with type change.
-			emit_set_native(p_target, p_source.type->variant_type, emit_get_native(p_source));
+			bjit::Value jit_value = emit_get_native(p_source);
+			emit_set_native(p_target, p_source.type, jit_value);
 		} else {
 			goto wrapper_call;
 		}
 		return;
-	} else if (p_source.type->is_builtin() && p_source.type == p_target.type) {
+	} else if (p_source.type->is_builtin() && (p_source.type == p_target.type || p_target.type->is_nil())) {
 		print_line("\tbuiltin assign");
 		p_target.drop_cached();
 
@@ -189,6 +190,8 @@ void GDScriptJitCodeGenerator::emit_assign(ValueRef& p_target, ValueRef& p_sourc
 			p_source.offset + _variant_data_field_offset,
 			p_source.type->size
 		);
+
+		p_target.type = p_source.type;
 		return;
 	}
 
@@ -422,7 +425,7 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, operand.type->variant_type, Variant::NIL);
 
 		print_line("\tresult type:", Variant::get_type_name(ret_type));
-		bjit::Value jit_value = operand.type->is_native() ? emit_get_native(operand) : emit_ptr_to_data(operand);
+		bjit::Value jit_value = operand.type->is_native() ? emit_get_native_abi_compat(operand) : emit_ptr_to_data(operand);
 		bjit::Value jit_result = op_codegen(proc, jit_value);
 
 		ValueRef source(ValueRef::EXTERNAL, ret_type, jit_result);
@@ -473,8 +476,8 @@ void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Va
 		Variant::Type ret_type = Variant::get_operator_return_type(p_operator, lhs.type->variant_type, rhs.type->variant_type);
 
 		print_line("\tnative - result type:", Variant::get_type_name(ret_type));
-		bjit::Value jit_lhs = lhs.type->is_native() ? emit_get_native(lhs) : emit_ptr_to_data(lhs);
-		bjit::Value jit_rhs = rhs.type->is_native() ? emit_get_native(rhs) : emit_ptr_to_data(rhs);
+		bjit::Value jit_lhs = lhs.type->is_native() ? emit_get_native_abi_compat(lhs) : emit_ptr_to_data(lhs);
+		bjit::Value jit_rhs = rhs.type->is_native() ? emit_get_native_abi_compat(rhs) : emit_ptr_to_data(rhs);
 		bjit::Value jit_result = op_codegen(proc, jit_lhs, jit_rhs);
 
 		ValueRef source(ValueRef::EXTERNAL, ret_type, jit_result);
@@ -729,7 +732,7 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 
 	print_line("assign", target.stringify(), ":=", source.stringify());
 
-	emit_assign(source, target);
+	emit_assign(target, source);
 }
 
 void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
@@ -741,12 +744,12 @@ void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
 
 void GDScriptJitCodeGenerator::write_assign_true(const Address &p_target) {
 	ValueRef& target = get_value_mut_ref(p_target);
-	emit_set_native(target, Variant::BOOL, proc.lci(1));
+	emit_set_native(target, GDScriptJit::TypeInfo::from<bool>(), proc.lci(1));
 }
 
 void GDScriptJitCodeGenerator::write_assign_false(const Address &p_target) {
 	ValueRef& target = get_value_mut_ref(p_target);
-	emit_set_native(target, Variant::BOOL, proc.lci(0));
+	emit_set_native(target, GDScriptJit::TypeInfo::from<bool>(), proc.lci(0));
 }
 
 void GDScriptJitCodeGenerator::write_assign_default_parameter(const Address &p_dst, const Address &p_src, bool p_use_conversion) {
@@ -834,7 +837,7 @@ void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const
 	if (!is_return) return;
 
 	jit_result = emit_cast_native(jit_result, GDScriptJit::TypeInfo::from_variant(ret_type), target->type);
-	emit_set_native(*target, target->type->variant_type, jit_result);
+	emit_set_native(*target, target->type, jit_result);
 }
 
 void GDScriptJitCodeGenerator::write_call_builtin_type(const Address &p_target, const Address &p_base, Variant::Type p_type, const StringName &p_method, bool p_is_static, const Vector<Address> &p_arguments) {
