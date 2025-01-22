@@ -492,7 +492,8 @@ void Proc::allocRegs(bool unsafeOpt)
                         ops[op.in[i]].reg = r;
                         regstate[r] = op.in[i];
                     }
-                    else
+                    // if it's not a constant..
+                    else if(!ops[op.in[i]].canCSE() || ops[op.in[i]].nInputs())
                     {
                         if(ra_debug)
                         {
@@ -664,7 +665,7 @@ void Proc::allocRegs(bool unsafeOpt)
             }
 
             // clobbers - could try to save, but whatever
-            RegMask lost = op.regsLost(); usedRegs |= lost;
+            RegMask lost = op.regsLost();
             if(lost)
             {
                 RegMask notlost = ~lost;
@@ -1328,8 +1329,6 @@ void Proc::allocRegs(bool unsafeOpt)
 
         if(op.scc >= sccUsed.size()) sccUsed.resize(op.scc + 1, false);
         if(op.flags.spill) sccUsed[op.scc] = true;
-
-        usedRegs |= R2Mask(op.reg);
     }
 
     std::vector<uint16_t>   slots(sccUsed.size(), 0xffff);
@@ -1559,4 +1558,21 @@ void Proc::findSCC()
     }
     
     if(scc_debug) debug();
+}
+
+void Proc::findUsedRegs()
+{
+    BJIT_LOG(" FindRegs");
+    usedRegs = 0;
+    for(auto b : live)
+    {
+        for(auto c : blocks[b].code)
+        {
+            usedRegs |= ops[c].regsLost();
+            if(ops[c].hasOutput())
+            {
+                usedRegs |= R2Mask(ops[c].reg);
+            }
+        }
+    }
 }
