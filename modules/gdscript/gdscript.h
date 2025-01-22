@@ -90,6 +90,7 @@ class GDScript : public Script {
 	friend class GDScriptLambdaSelfCallable;
 	friend class GDScriptLanguage;
 	friend struct GDScriptUtilityFunctionsDefinitions;
+	friend class GDScriptJitCodeGenerator;
 
 	Ref<GDScriptNativeClass> native;
 	Ref<GDScript> base;
@@ -418,6 +419,7 @@ public:
 
 class GDScriptLanguage : public ScriptLanguage {
 	friend class GDScriptFunctionState;
+	friend class GDScriptJitCodeGenerator;
 
 	static GDScriptLanguage *singleton;
 

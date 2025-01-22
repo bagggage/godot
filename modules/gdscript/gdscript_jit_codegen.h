@@ -47,6 +47,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	};
 
 	static constexpr bjit::Value jit_sp { 0 };
+	static HashMap<GDScriptFunction*, bjit::Module> jit_modules_map;
 
 	static constexpr unsigned _variant_data_field_offset = sizeof(uint64_t);
 	static constexpr unsigned _object_data_ptr_field_offset = sizeof(ObjectID);
@@ -106,6 +107,12 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 				GDScriptJit::TypeInfo::from_variant(p_type.builtin_type) :
 				GDScriptJit::TypeInfo::from<std::nullptr_t>();
 		}
+		ValueRef(const AddressMode p_mode, Variant::Type p_type, bjit::Value p_value) :
+				cached(p_value), mode(p_mode), type(GDScriptJit::TypeInfo::from_variant(p_type)) {}
+		ValueRef(const AddressMode p_mode, Variant::Type p_type, bjit::Value p_ptr, int p_offset) :
+				ptr(p_ptr), mode(p_mode), type(GDScriptJit::TypeInfo::from_variant(p_type)), offset(p_offset) {}
+		ValueRef(const AddressMode p_mode, const GDScriptJit::TypeInfo* p_type, bjit::Value p_ptr, int p_offset) :
+				ptr(p_ptr), mode(p_mode), type(p_type), offset(p_offset) {}
 
 		ValueRef(const Variant &p_constant) {
 			mode = CONSTANT;
@@ -190,7 +197,7 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 	GDScriptFunction *function;
 
-	bjit::Module jit_module;
+	bjit::Module* jit_module = nullptr;
 	bjit::Proc proc = bjit::Proc(0, "iiii");
 
 	Vector<bjit::Label> jit_labels;
@@ -213,6 +220,9 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	RBMap<int, Variant> constant_values;
 	HashMap<Variant, int, VariantHasher, VariantComparator> constant_map;
 	RBMap<StringName, int> name_map;
+
+	HashMap<uintptr_t, int> functions_map;
+	HashMap<StringName, int> utilities_map;
 
 	int max_locals = 0;
 
@@ -295,6 +305,24 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 	// TODO: For the future optimizations...
 	ValueRef& get_value_mut_ref(const Address& p_address) {
 		return get_value_ref(p_address);
+	}
+
+	int get_utility_function_index(const StringName &p_name) {
+		if (utilities_map.has(p_name)) return utilities_map.get(p_name);
+
+		int index = jit_module->compileStub((uintptr_t)Variant::get_utility_function_ptr(p_name));
+		utilities_map[p_name] = index;
+		
+		return index;
+	}
+
+	int get_function_index(const uintptr_t p_func_ptr) {
+		if (functions_map.has(p_func_ptr)) return functions_map.get(p_func_ptr);
+
+		int index = jit_module->compileStub(p_func_ptr);
+		functions_map[p_func_ptr] = index;
+
+		return index;
 	}
 
 	void store_native(bjit::Value p_value, bjit::Value p_ptr, const GDScriptJit::TypeInfo* p_type, unsigned offset) {
@@ -488,7 +516,6 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 
 	void emit_sync_value_cache(ValueRef& p_value, bool sync_type = true) {
 		DEV_ASSERT(p_value.is_allocated());
-		if (p_value.mode == ValueRef::EXTERNAL) return;
 
 		switch (p_value.state) {
 			case ValueRef::TYPE_CHANGED:
@@ -520,19 +547,13 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 					p_value.ptr = proc.li64(proc.env[ENV_FUNC_ARGS], p_value.offset);
 					p_value.offset = 0;
 				}
-				p_value.cached = load_native(p_value.ptr, p_value.type, p_value.offset);
+				p_value.cached = load_native(p_value.ptr, p_value.type, p_value.get_data_offset());
 			}
 		}
 		return p_value.cached;
 	}
 
 	void emit_set_native(ValueRef& p_destination, const Variant::Type p_src_type, const bjit::Value p_jit_value) {
-		DEV_ASSERT(
-			p_destination.mode == ValueRef::TEMPORARY ||
-			p_destination.mode == ValueRef::LOCAL ||
-			p_destination.mode == ValueRef::ARGUMENT
-		);
-
 		p_destination.update_type(p_src_type);
 		p_destination.update_value(p_jit_value);
 	}
@@ -581,6 +602,19 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 		return proc.iadd(jit_sp, proc.lcu(argptrs_offset));
 	}
 
+	void emit_load_args(const Vector<Address> &p_args, const StringName &p_name) {
+		for (int i = 0; i < p_args.size(); ++i) {
+			ValueRef& value = get_value_ref(p_args[i]);
+			ERR_FAIL_COND_MSG(!value.type->is_native(), "Invalid argument for utility call");
+
+			bjit::Value jit_value = emit_get_native(value);
+			Variant::Type target_type = Variant::get_utility_function_argument_type(p_name, i);
+
+			jit_value = emit_cast_native(jit_value, value.type, GDScriptJit::TypeInfo::from_variant(target_type));
+			proc.env.push_back(jit_value);
+		}
+	}
+
 	template<typename R, typename... FuncArgs, typename... JitArgs>
 	void emit_function_call(R (*func_ptr)(FuncArgs...), JitArgs... jit_args) {
 		static_assert(sizeof...(FuncArgs) == sizeof...(JitArgs));
@@ -591,12 +625,14 @@ class GDScriptJitCodeGenerator : public GDScriptCodeGenerator {
 			(proc.env.push_back(jit_args),...);
 		}
 
-		proc.icallp(proc.lcu((uintptr_t)func_ptr), args_count);
+		proc.icalln(get_function_index((uintptr_t)func_ptr), args_count);
 
 		if constexpr (args_count > 0) {
 			proc.env.resize(proc.env.size() - args_count);
 		}
 	}
+
+	void emit_assign(ValueRef& p_target, ValueRef& p_source);
 
 	void add_stack_identifier(const StringName &p_id, int p_stackpos) {
 		if (locals.size() > max_locals) {

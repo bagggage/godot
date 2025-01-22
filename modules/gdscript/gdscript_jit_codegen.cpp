@@ -46,8 +46,9 @@ static void _method_bind_call_wrapper(
 static void _method_bind_validated_call_wrapper(
 	const MethodBind* method, Object* p_object, const Variant** p_args, Variant* r_ret
 ) {
-	method->validated_call(p_object, p_args, r_ret);
 	//print_line("validated call ret:", Variant::get_type_name(r_ret->get_type()), r_ret->stringify());
+
+	method->validated_call(p_object, p_args, r_ret);
 }
 
 static void _variant_get_named_wrapper(const Variant* variant, const StringName& p_member, Variant* dst) {
@@ -154,6 +155,53 @@ static void _variant_evaluate_wrapper(const Variant::Operator op, const Variant&
 
 static void _variant_assign_wrapper(Variant* destination, const Variant* source) {
 	*destination = *source;
+}
+
+HashMap<GDScriptFunction*, bjit::Module> GDScriptJitCodeGenerator::jit_modules_map = {};
+
+void GDScriptJitCodeGenerator::emit_assign(ValueRef& p_target, ValueRef& p_source) {
+	if (p_target.type->is_dynamic() && !p_target.type->is_nil()) goto wrapper_call;
+
+	if (p_source.type->is_native() && (p_target.type->is_native() || p_target.type->is_nil())) {
+		print_line("\tnative assign");
+
+		if (p_target.type->is_native()) {
+			// Cast.
+			p_target.update_value(emit_cast_native(emit_get_native(p_source), p_source.type, p_target.type));
+		} else if (p_target.type->is_nil() && p_target.can_be_cached()) {
+			// Assign with type change.
+			emit_set_native(p_target, p_source.type->variant_type, emit_get_native(p_source));
+		} else {
+			goto wrapper_call;
+		}
+		return;
+	} else if (p_source.type->is_builtin() && p_source.type == p_target.type) {
+		print_line("\tbuiltin assign");
+		p_target.drop_cached();
+
+		try_alloc_variant_object(p_source);
+		try_alloc_variant_object(p_target);
+
+		GDScriptJit::memcpy_aligned(
+			proc, p_target.ptr,
+			p_target.offset + _variant_data_field_offset,
+			p_source.ptr,
+			p_source.offset + _variant_data_field_offset,
+			p_source.type->size
+		);
+		return;
+	}
+
+wrapper_call:
+	print_line("\tdynamic assign");
+	emit_function_call(
+		_variant_assign_wrapper,
+		emit_ptr_to_object(p_target),
+		emit_ptr_to_object(p_source)
+	);
+
+	p_target.drop_cached();
+	p_target.type = p_source.type;
 }
 
 uint32_t GDScriptJitCodeGenerator::add_parameter(const StringName &p_name, bool p_is_optional, const GDScriptDataType &p_type) {
@@ -280,6 +328,8 @@ void GDScriptJitCodeGenerator::write_start(GDScript *p_script, const StringName 
 
 	function = memnew(GDScriptFunction);
 
+	jit_module = &jit_modules_map[function];
+
 	function->name = p_function_name;
 	function->_script = p_script;
 	function->source = p_script->get_script_path();
@@ -296,32 +346,29 @@ void GDScriptJitCodeGenerator::write_start(GDScript *p_script, const StringName 
 }
 
 GDScriptFunction *GDScriptJitCodeGenerator::write_end() {
-	static HashMap<GDScriptFunction*, bjit::Module> jit_modules_map;
-
-	bjit::Module& jit_module = jit_modules_map[function];
-	if (jit_module.isLoaded()) jit_module.unload();
-
 	// Setup stack size.
 	proc.getOps()[0].imm32 = max_stack_size * sizeof(Variant);
+
+	if (jit_module->isLoaded()) jit_module->unload();
 
 	// Compile and debug.
 	int proc_index = 0;
 	{
 		proc.iret(proc.lcu(0));
-		proc_index = jit_module.compile(proc);
+		proc_index = jit_module->compile(proc);
 
 		// Hexdump of machine code.
 		print_line("machine code:");
 		String text;
-		for (auto byte : jit_module.getBytes()) {
+		for (auto byte : jit_module->getBytes()) {
 			text += vformat("%02x ", byte);
 		}
-		print_line(""); print_line(text);
+	 	print_line(text); print_line("");
 	}
 
-	jit_module.load();
+	jit_module->load();
 
-	function->_jit_function = jit_module.getPointer<ProcFunction>(proc_index);
+	function->_jit_function = jit_module->getPointer<ProcFunction>(proc_index);
 	function->_stack_size = max_stack_size;
 	function->_constants_ptr = function->constants.ptrw();
 	function->_constant_count = function->constants.size();
@@ -378,12 +425,9 @@ void GDScriptJitCodeGenerator::write_unary_operator(const Address &p_target, Var
 		bjit::Value jit_value = operand.type->is_native() ? emit_get_native(operand) : emit_ptr_to_data(operand);
 		bjit::Value jit_result = op_codegen(proc, jit_value);
 
-		if (operand.type->is_native()) {
-			emit_set_native(target, ret_type, jit_result);
-		} else {
-			// TODO: Do something
-			target.update_type(ret_type);
-		}
+		ValueRef source(ValueRef::EXTERNAL, ret_type, jit_result);
+		emit_assign(target, source);
+
 		return;
 	}
 
@@ -433,12 +477,8 @@ void GDScriptJitCodeGenerator::write_binary_operator(const Address &p_target, Va
 		bjit::Value jit_rhs = rhs.type->is_native() ? emit_get_native(rhs) : emit_ptr_to_data(rhs);
 		bjit::Value jit_result = op_codegen(proc, jit_lhs, jit_rhs);
 
-		if (target.type->is_native()) {
-			emit_set_native(target, ret_type, jit_result);
-		} else {
-			// TODO: Do something
-			target.update_type(ret_type);
-		}
+		ValueRef source(ValueRef::EXTERNAL, ret_type, jit_result);
+		emit_assign(target, source);
 		return;
 	}
 
@@ -519,27 +559,16 @@ void GDScriptJitCodeGenerator::write_set_named(const Address &p_target, const St
 		if (!target.type->fields.has(p_name)) goto wrapper_call;
 		const GDScriptJit::TypeInfo::FieldInfo& field_info = target.type->fields.get(p_name);
 
-		if (field_info.type->is_native() && source.type->is_native()) {
-			print_line("\tnative");
-			try_alloc_variant_object(target);
+		if (
+			(field_info.type->is_dynamic() && !field_info.type->is_nil()) ||
+			(field_info.type->is_builtin() && source.type != field_info.type)
+		) goto wrapper_call;
 
-			bjit::Value jit_casted = emit_cast_native(emit_get_native(source), source.type, field_info.type);
-			store_native(jit_casted, target.ptr, field_info.type, target.get_data_offset() + field_info.offset);
-		} else if (field_info.type->is_builtin() && source.type == field_info.type) {
-			print_line("\tbuiltin");
-			try_alloc_variant_object(source);
-			try_alloc_variant_object(target);
+		try_alloc_variant_object(target);
 
-			GDScriptJit::memcpy_aligned(
-				proc, target.ptr,
-				target.get_data_offset() + field_info.offset,
-				source.ptr,
-				source.get_data_offset(),
-				field_info.type->size
-			);
-		} else {
-			goto wrapper_call;
-		}
+		ValueRef field(ValueRef::EXTERNAL, field_info.type, target.ptr, target.offset + field_info.offset);
+		emit_assign(field, source);
+		emit_sync_value_cache(field, false);
 		return;
 	}
 
@@ -548,8 +577,6 @@ wrapper_call:
 
 	bjit::Value jit_source_ptr = emit_ptr_to_object(source);
 	bjit::Value jit_target_ptr = emit_ptr_to_object(target);
-
-	// TODO: Implement some optimizations?
 
 	emit_function_call(
 		_variant_set_named_wrapper,
@@ -569,28 +596,16 @@ void GDScriptJitCodeGenerator::write_get_named(const Address &p_target, const St
 		if (!source.type->fields.has(p_name)) goto wrapper_call;
 		const GDScriptJit::TypeInfo::FieldInfo& field_info = source.type->fields.get(p_name);
 
-		if (field_info.type->is_native() && (target.type->is_native() || target.type->is_nil())) {
-			print_line("\tnative");
-			try_alloc_variant_object(source);
+		if (
+			field_info.type->is_dynamic() ||
+			(target.type->is_dynamic() && !target.type->is_nil()) ||
+			(field_info.type->is_builtin() && source.type != field_info.type)
+		) goto wrapper_call;
 
-			bjit::Value jit_value = load_native(source.ptr, field_info.type, source.get_data_offset() + field_info.offset);
-			jit_value = emit_cast_native(jit_value, field_info.type, target.type);
-			emit_set_native(target, target.type->variant_type, jit_value);
-		} else if (field_info.type->is_builtin() && target.type == field_info.type) {
-			print_line("\tbuiltin");
-			try_alloc_variant_object(target);
-			try_alloc_variant_object(source);
+		try_alloc_variant_object(source);
 
-			GDScriptJit::memcpy_aligned(
-				proc, target.ptr,
-				target.get_data_offset(),
-				source.ptr,
-				source.get_data_offset() + field_info.offset,
-				field_info.type->size
-			);
-		} else {
-			goto wrapper_call;
-		}
+		ValueRef field(ValueRef::EXTERNAL, field_info.type, source.ptr, source.offset + field_info.offset);
+		emit_assign(target, field);
 		return;
 	}
 
@@ -618,7 +633,7 @@ void GDScriptJitCodeGenerator::write_set_member(const Address &p_value, const St
 	if (member_info.index >= 0) {
 		ERR_FAIL_MSG("Set member for script members is not implemented");	
 	} else if (member_info.setter) {
-		print_line("\tmethod bind Setter");
+		print_line("\tmethod bind setter");
 		emit_function_call(
 			_method_bind_validated_call_wrapper,
 			proc.lcu((uintptr_t)member_info.setter),
@@ -714,54 +729,7 @@ void GDScriptJitCodeGenerator::write_assign(const Address &p_target, const Addre
 
 	print_line("assign", target.stringify(), ":=", source.stringify());
 
-	if (target.type->is_dynamic() && !target.type->is_nil()) goto dynamic_assign;
-
-	if (source.type->is_native()) {
-		print_line("\tnative");
-		if (source.type != target.type) {
-			if (target.type->is_native()) {
-				// Cast.
-				target.update_value(emit_cast_native(emit_get_native(source), source.type, target.type));
-			} else if (target.type->is_nil() && target.can_be_cached()) {
-				// Assign with type change.
-				emit_set_native(target, source.type->variant_type, emit_get_native(source));
-			} else {
-				goto dynamic_assign;
-			}
-			return;
-		}
-		target.update_value(emit_get_native(source));
-	} else if (source.type->is_builtin()) {
-		print_line("\tbuiltin");
-		target.drop_cached();
-
-		try_alloc_variant_object(source);
-		try_alloc_variant_object(target);
-
-		GDScriptJit::memcpy_aligned(
-			proc, target.ptr,
-			target.offset + _variant_data_field_offset,
-			source.ptr,
-			source.offset + _variant_data_field_offset,
-			source.type->size
-		);
-
-		if (source.type != target.type) {
-			target.update_type(source.type->variant_type);
-		}
-	}
-	return;
-
-dynamic_assign:
-	print_line("\twrapper call");
-	emit_function_call(
-		_variant_assign_wrapper,
-		emit_ptr_to_object(target),
-		emit_ptr_to_object(source)
-	);
-	
-	target.drop_cached();
-	target.type = source.type;
+	emit_assign(source, target);
 }
 
 void GDScriptJitCodeGenerator::write_assign_null(const Address &p_target) {
@@ -782,9 +750,23 @@ void GDScriptJitCodeGenerator::write_assign_false(const Address &p_target) {
 }
 
 void GDScriptJitCodeGenerator::write_assign_default_parameter(const Address &p_dst, const Address &p_src, bool p_use_conversion) {
+	ValueRef& source = get_value_ref(p_src);
+	ValueRef& destination = get_value_mut_ref(p_dst);
+
+	emit_assign(destination, source);
 }
 
 void GDScriptJitCodeGenerator::write_store_global(const Address &p_dst, int p_global_index) {
+	constexpr unsigned _globals_ptr_offset = offsetof(GDScriptLanguage, _global_array);
+	GDScriptLanguage* language_ptr = GDScriptLanguage::get_singleton();
+
+	bjit::Value jit_globals_ptr = proc.li64(proc.lcu((uintptr_t)language_ptr), _globals_ptr_offset);
+	Variant::Type global_type = language_ptr->get_global_array()[p_global_index].get_type();
+
+	ValueRef& destination = get_value_mut_ref(p_dst);
+	ValueRef global(ValueRef::EXTERNAL, global_type, jit_globals_ptr, p_global_index * sizeof(Variant));
+
+	emit_assign(destination, global);
 }
 
 void GDScriptJitCodeGenerator::write_store_named_global(const Address &p_dst, const StringName &p_global) {
@@ -809,15 +791,19 @@ void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const
 	print_line("utility call:", p_function);
 
 	bool is_return = Variant::has_utility_function_return_value(p_function);
+	Variant::Type ret_type = is_return ? Variant::get_utility_function_return_type(p_function) : Variant::NIL;
 	ValueRef* target = is_return ? &get_value_mut_ref(p_target) : nullptr;
 
 	print_line("\treturns:", is_return, "target:", target ? target->stringify() : "none");
 
-	bjit::Value jit_args = emit_load_ptr_args(p_arguments);
-	bjit::Value jit_target_ptr = is_return ? emit_ptr_to_object(*target) : proc.lci(0);
+	if (Variant::get_utility_function_argument_count(p_function) == 1 &&
+		Variant::get_utility_function_argument_type(p_function, 0) == Variant::NIL
+	) {
+		Variant::ValidatedUtilityFunction utility_func = Variant::get_validated_utility_function(p_function);
 
-	Variant::ValidatedUtilityFunction utility_func = Variant::get_validated_utility_function(p_function);
-	if (utility_func) {
+		bjit::Value jit_args = emit_load_ptr_args(p_arguments);
+		bjit::Value jit_target_ptr = is_return ? emit_ptr_to_object(*target) : proc.lci(0);
+
 		if (is_return) {
 			target->update_type(Variant::get_utility_function_return_type(p_function));
 		}
@@ -832,17 +818,23 @@ void GDScriptJitCodeGenerator::write_call_utility(const Address &p_target, const
 		return;
 	}
 
-	if (is_return) {
-		target->evaluate(Variant::get_utility_function_return_type(p_function));
+	print_line("\tnative");
+	int jit_utility_index = get_utility_function_index(p_function);
+	emit_load_args(p_arguments, p_function);
+
+	bjit::Value jit_result {0};
+
+	if (ret_type == Variant::FLOAT) {
+		jit_result = proc.dcalln(jit_utility_index, p_arguments.size());
+	} else {
+		jit_result = proc.icalln(jit_utility_index, p_arguments.size());
 	}
 
-	emit_function_call(
-		_variant_call_utility_function_wrapper,
-		emit_name_ptr(p_function),
-		jit_target_ptr,
-		jit_args,
-		proc.lci(p_arguments.size())
-	);
+	proc.env.resize(proc.env.size() - p_arguments.size());
+	if (!is_return) return;
+
+	jit_result = emit_cast_native(jit_result, GDScriptJit::TypeInfo::from_variant(ret_type), target->type);
+	emit_set_native(*target, target->type->variant_type, jit_result);
 }
 
 void GDScriptJitCodeGenerator::write_call_builtin_type(const Address &p_target, const Address &p_base, Variant::Type p_type, const StringName &p_method, bool p_is_static, const Vector<Address> &p_arguments) {
@@ -861,9 +853,39 @@ void GDScriptJitCodeGenerator::write_call_native_static_validated(const GDScript
 }
 
 void GDScriptJitCodeGenerator::write_call_method_bind(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
+	print_line("method bind:", get_value_ref(p_base).stringify() + "." + (String)p_method->get_name() + "(...)", "->", get_value_ref(p_target).stringify());
+
+	//emit_function_call(
+	//	_method_bind_call_wrapper,
+	//	proc.lcu((uintptr_t)p_method),
+	//);
 }
 
 void GDScriptJitCodeGenerator::write_call_method_bind_validated(const Address &p_target, const Address &p_base, MethodBind *p_method, const Vector<Address> &p_arguments) {
+	print_line("method bind validated:", get_value_ref(p_base).stringify() + "." + (String)p_method->get_name() + "(...)", "->", get_value_ref(p_target).stringify());
+
+	ValueRef& base = get_value_ref(p_base);
+	ValueRef& target = get_value_mut_ref(p_target);
+
+	bjit::Value jit_object_ptr;
+	bjit::Value jit_ptr_args = emit_load_ptr_args(p_arguments);
+	bjit::Value jit_target = emit_ptr_to_object(target);
+
+	if (base.mode == ValueRef::CONSTANT) {
+		const Variant& object = get_constant_value(base);
+		jit_object_ptr = proc.lcu((uintptr_t)object.get_validated_object());
+	} else {
+		ERR_FAIL_MSG("Not implemented");
+		return;
+	}
+
+	emit_function_call(
+		_method_bind_validated_call_wrapper,
+		proc.lcu((uintptr_t)p_method),
+		jit_object_ptr,
+		jit_ptr_args,
+		jit_target
+	);
 }
 
 void GDScriptJitCodeGenerator::write_call_self(const Address &p_target, const StringName &p_function_name, const Vector<Address> &p_arguments) {
