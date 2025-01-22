@@ -812,6 +812,7 @@ public:
 	static Variant::Type get_utility_function_return_type(const StringName &p_name);
 	static bool is_utility_function_vararg(const StringName &p_name);
 	static uint32_t get_utility_function_hash(const StringName &p_name);
+	static void *get_utility_function_ptr(const StringName &p_name);
 
 	static void get_utility_function_list(List<StringName> *r_functions);
 	static int get_utility_function_count();

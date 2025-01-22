@@ -1376,6 +1376,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		static Variant::UtilityFunctionType get_type() {                                                         \
 			return m_category;                                                                                   \
 		}                                                                                                        \
+		static void* get_function_ptr() {                                                                        \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                    \
+		}                                                                                                        \
 	};                                                                                                           \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
 
@@ -1411,6 +1414,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		}                                                                                                               \
 		static Variant::UtilityFunctionType get_type() {                                                                \
 			return m_category;                                                                                          \
+		}                                                                                                               \
+		static void* get_function_ptr() {                                                                               \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                           \
 		}                                                                                                               \
 	};                                                                                                                  \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
@@ -1450,6 +1456,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		static Variant::UtilityFunctionType get_type() {                                                                           \
 			return m_category;                                                                                                     \
 		}                                                                                                                          \
+		static void* get_function_ptr() {                                                                                          \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                                      \
+		}                                                                                                                          \
 	};                                                                                                                             \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
 
@@ -1487,6 +1496,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		}                                                                                                                                                                 \
 		static Variant::UtilityFunctionType get_type() {                                                                                                                  \
 			return m_category;                                                                                                                                            \
+		}                                                                                                                                                                 \
+		static void* get_function_ptr() {                                                                                                                                 \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                                                                             \
 		}                                                                                                                                                                 \
 	};                                                                                                                                                                    \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
@@ -1533,6 +1545,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		static Variant::UtilityFunctionType get_type() {                                                         \
 			return m_category;                                                                                   \
 		}                                                                                                        \
+		static void* get_function_ptr() {                                                                        \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                    \
+		}                                                                                                        \
 	};                                                                                                           \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
 
@@ -1578,6 +1593,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		static Variant::UtilityFunctionType get_type() {                                                         \
 			return m_category;                                                                                   \
 		}                                                                                                        \
+		static void* get_function_ptr() {                                                                        \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                    \
+		}                                                                                                        \
 	};                                                                                                           \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
 
@@ -1622,6 +1640,9 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		static Variant::UtilityFunctionType get_type() {                                                         \
 			return m_category;                                                                                   \
 		}                                                                                                        \
+		static void* get_function_ptr() {                                                                        \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                    \
+		}                                                                                                        \
 	};                                                                                                           \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
 
@@ -1655,10 +1676,14 @@ static _FORCE_INLINE_ Variant::Type get_ret_type_helper(void (*p_func)(P...)) {
 		static Variant::UtilityFunctionType get_type() {                                                         \
 			return m_category;                                                                                   \
 		}                                                                                                        \
+		static void* get_function_ptr() {                                                                        \
+			return reinterpret_cast<void*>(&VariantUtilityFunctions::m_func);                                    \
+		}                                                                                                        \
 	};                                                                                                           \
 	register_utility_function<Func_##m_func>(#m_func, m_args)
 
 struct VariantUtilityFunctionInfo {
+	void *function_ptr = nullptr;
 	void (*call_utility)(Variant *r_ret, const Variant **p_args, int p_argcount, Callable::CallError &r_error) = nullptr;
 	Variant::ValidatedUtilityFunction validated_call_utility = nullptr;
 	Variant::PTRUtilityFunction ptr_call_utility = nullptr;
@@ -1684,6 +1709,7 @@ static void register_utility_function(const String &p_name, const Vector<String>
 	ERR_FAIL_COND(utility_function_table.has(sname));
 
 	VariantUtilityFunctionInfo bfi;
+	bfi.function_ptr = T::get_function_ptr();
 	bfi.call_utility = T::call;
 	bfi.validated_call_utility = T::validated_call;
 	bfi.ptr_call_utility = T::ptrcall;
@@ -2008,6 +2034,10 @@ uint32_t Variant::get_utility_function_hash(const StringName &p_name) {
 	}
 
 	return hash_fmix32(hash);
+}
+
+void *Variant::get_utility_function_ptr(const StringName &p_name) {
+	return utility_function_table.lookup_ptr(p_name)->function_ptr;
 }
 
 void Variant::get_utility_function_list(List<StringName> *r_functions) {
