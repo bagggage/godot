@@ -30,6 +30,8 @@
 
 #include "gdscript_jit.h"
 
+#include "core/object/object.h"
+
 #include "core/templates/hash_map.h"
 
 template<typename L>
@@ -261,7 +263,8 @@ static const GDScriptJit::TypeInfo* _builtin_type_info_from() {
         return &type_info;                                             \
     }
 
-BUILTIN_TYPE(std::nullptr_t, Variant::NIL, ());
+BUILTIN_TYPE(std::nullptr_t, Variant::NIL,    ());
+BUILTIN_TYPE(Object*,        Variant::OBJECT, ());
 
 BUILTIN_TYPE(bool,    Variant::BOOL,  ());
 BUILTIN_TYPE(int32_t, Variant::INT,   ());
@@ -320,7 +323,7 @@ GDScriptJit::binary_operators_table[Variant::VARIANT_MAX][Variant::VARIANT_MAX][
     GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::BIT_NEGATE] = &NativeUnaryOperators<m_native>::bit_neg; \
     GDScriptJit::unary_operators_table[m_v_type][GDScriptJit::BOOL_NOT]   = &NativeUnaryOperators<m_native>::bool_not;
 
-#define REGISTER_NATIVE_BINARY_OPERATORS(m_l_n,m_l_v_type,m_r_n,m_r_v_type)                                                      \
+#define REGISTER_NATIVE_BINARY_OPERATORS(m_l_n,m_l_v_type,m_r_n,m_r_v_type)                                                       \
     GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_ADD]      = &NativeBinaryOperators<m_l_n,m_r_n>::add; \
     GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_SUBTRACT] = &NativeBinaryOperators<m_l_n,m_r_n>::sub; \
     GDScriptJit::binary_operators_table[m_l_v_type][m_r_v_type][Variant::OP_MULTIPLY] = &NativeBinaryOperators<m_l_n,m_r_n>::mul; \
@@ -370,6 +373,8 @@ void GDScriptJit::TypeInfo::register_type() {
 
 bool GDScriptJit::TypeInfo::register_builtin_types() {
     register_type<std::nullptr_t>();
+    register_type<Object*>();
+
     register_type<bool>();
     register_type<int32_t>();
     register_type<int64_t>();
